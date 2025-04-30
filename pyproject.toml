@@ -1,0 +1,12 @@
+[build-system]
+requires = ["setuptools>=42", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "oceanpy-experiments"
+version = "0.1.0"
+description = "Experimental framework to compare oceanpy CP and MIP models on counterfactual explanation tasks"
+authors = [{name = "Awa Khouna", email = "your.email@example.com"}]
+readme = "README.md"
+license = {file = "LICENSE"}
+requires-python = ">=3.8"
