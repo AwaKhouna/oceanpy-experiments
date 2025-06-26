@@ -1,3 +1,8 @@
 oceanpy
 argparse
 logging
+pandas
+numpy
+scikit-learn
+ucimlrepo
+setuptools

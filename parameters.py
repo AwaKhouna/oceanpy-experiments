@@ -1,0 +1,5 @@
+DATASETS = ["COMPAS", "Adult", "Credit"]
+SEEDS = [42, 123, 456]
+MODELS = ["cp", "mip"]
+N_ESTIMATORS = [50, 100, 200, 500, 1000]
+MAX_DEPTHS = [3, 5, 10, 20, None]
