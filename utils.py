@@ -4,8 +4,11 @@ import pandas as pd
 from ocean.feature import parse_features
 
 
+URL = "https://github.com/eminyous/ocean-datasets/blob/main"
+
+
 def parse_dataset(
-    dataset_path: str,
+    dataset: str,
     scale: bool = True,
     return_mapper: bool = False,
 ) -> pd.DataFrame:
@@ -18,6 +21,7 @@ def parse_dataset(
     Returns:
         pd.DataFrame: Parsed dataset.
     """
+    dataset_path = f"{URL}/{dataset}/{dataset}.csv?raw=true"
     data = pd.read_csv(dataset_path, header=[0, 1])
     types: pd.Index[str] = data.columns.get_level_values(1)
     columns: pd.Index[str] = data.columns.get_level_values(0)
@@ -45,6 +49,7 @@ def train_model(
     n_estimators: int = 100,
     max_depth: int = None,
     seed: int = 42,
+    n_jobs: int = -1,
     return_accuracy: bool = False,
 ) -> RandomForestClassifier | tuple[RandomForestClassifier, float]:
     """
@@ -62,6 +67,7 @@ def train_model(
         n_estimators=n_estimators,
         max_depth=max_depth,
         random_state=seed,
+        n_jobs=n_jobs,
     )
     model.fit(data, y)
 
@@ -78,10 +84,8 @@ def test_functions():
     Test the train_model function with a sample dataset.
     """
     # Sample dataset
-    URL = "https://github.com/eminyous/ocean-datasets/blob/main"
     dataset = "COMPAS"
-    dataset_path = f"{URL}/{dataset}/{dataset}.csv?raw=true"
-    (data, y), mapper = parse_dataset(dataset_path, return_mapper=True)
+    (data, y), mapper = parse_dataset(dataset, return_mapper=True)
     print("Parsed DataFrame:")
     print(data.head())
     print("Target values:")
@@ -100,5 +104,5 @@ def test_functions():
     print(model)
 
 
-if __name__ == "__main__":
-    test_functions()
+# if __name__ == "__main__":
+#    test_functions()
