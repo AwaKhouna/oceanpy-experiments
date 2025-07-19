@@ -8,9 +8,9 @@ import argparse
 from pathlib import Path
 from typing import Any, Dict, List
 from concurrent.futures import ProcessPoolExecutor, as_completed
-
 import gurobipy as gp
 import numpy as np
+import pandas as pd
 
 from parameters import (
     DATASETS,
@@ -65,26 +65,31 @@ def make_explainer(
         raise ValueError(f"Unknown explainer type: {explainer_type}")
 
 
-def explain_one(query: np.ndarray, model: Any, explainer: Any) -> Dict[str, Any]:
+def explain_one(
+    query: np.ndarray,
+    y: int,
+    explainer: MixedIntegerProgramExplainer | ConstraintProgrammingExplainer,
+) -> Dict[str, Any]:
     t0 = time.time()
-    y = 1 - model.predict(query)[0]
-    explainer.add_objective(query[0], norm=1)
-    explainer.set_majority_class(y=y)
 
     if hasattr(explainer, "solver"):  # CPExp
-        explainer.solver.Solve(explainer)
+        explainer.explain(query, y=y, norm=1, save_callback=True)
         status = explainer.solver.status_name()
     else:  # MIPExp
-        explainer.optimize()
+        explainer.explain(query, y=y, norm=1, return_callback=True)
         status = explainer.Status
     explainer.cleanup()
 
-    return {"status": status, "time": time.time() - t0}
+    return {
+        "status": status,
+        "time": time.time() - t0,
+        "callback": explainer.callback.sollist,
+    }
 
 
 def get_performance_metrics(
     model: Any,
-    data: np.ndarray,
+    data: pd.DataFrame,
     mapper: Any,
     explainer_type: str,
     seed: int,
@@ -92,9 +97,14 @@ def get_performance_metrics(
 ) -> List[Dict[str, Any]]:
     explainer = make_explainer(model, mapper, explainer_type, seed, threads)
     metrics: List[Dict[str, Any]] = []
-    for row in data[np.random.choice(data.shape[0], N_SAMPLES, replace=False)]:
-        q = row.reshape(1, -1)
-        metrics.append(explain_one(q, model, explainer))
+    test_data = (
+        data.sample(n=N_SAMPLES, random_state=seed) if N_SAMPLES < len(data) else data
+    )
+    for i in test_data.index:
+        q = test_data.loc[i].to_numpy().flatten()
+        y = 1 - model.predict([q])[0]
+        res = explain_one(q, y, explainer)
+        metrics.append(res)
     return metrics
 
 
@@ -127,7 +137,7 @@ def run_experiment(
     }
     for expl_type in MODELS:
         out["explanations"][expl_type] = get_performance_metrics(
-            model, X.values, mapper, expl_type, seed, threads
+            model, X, mapper, expl_type, seed, threads
         )
     return out
 
@@ -179,8 +189,8 @@ def main() -> int:
         "--threads",
         "-t",
         type=int,
-        default=2,
-        help="CPUs per worker process (default: 2)",
+        default=1,
+        help="CPUs per worker process (default: 1)",
     )
     args = parser.parse_args()
 
