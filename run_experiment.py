@@ -26,6 +26,7 @@ from ocean import MixedIntegerProgramExplainer, ConstraintProgrammingExplainer
 import warnings
 
 warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")
+logger = logging.getLogger(__name__)
 
 
 def set_thread_envvars(threads: int) -> None:
@@ -111,13 +112,17 @@ def get_performance_metrics(
 def run_experiment(
     dataset_path: str, n_estimators: int, max_depth: int, seed: int, threads: int
 ) -> Dict[str, Any]:
-    logging.info(
+    logger.info(
         "Dataset=%s | n_estimators=%d | max_depth=%s | seed=%d | threads=%d",
         dataset_path,
         n_estimators,
         max_depth,
         seed,
         threads,
+    )
+    print(
+        f"Running experiment on {dataset_path} with n_estimators={n_estimators}, "
+        f"max_depth={max_depth}, seed={seed}, threads={threads}"
     )
 
     (X, y), mapper = parse_dataset(dataset_path, return_mapper=True)
@@ -146,14 +151,14 @@ def save_results(
     results: List[Dict[str, Any]],
     dataset: str,
 ) -> None:
-    results_path = Path(f"results_{dataset}.json")
+    results_path = Path(f"results/{dataset}.json")
     new_res: List[Dict[str, Any]] = []
     if results_path.exists():
         with open(results_path, "r") as f:
             new_res += json.load(f)
     new_res.append(results)
     results_path.write_text(json.dumps(new_res, indent=2))
-    logging.info("Results saved to %s", results_path)
+    logger.info("Results saved to %s", results_path)
 
 
 def run_experiments(threads: int) -> None:
@@ -161,15 +166,18 @@ def run_experiments(threads: int) -> None:
 
     total_cpus = os.cpu_count() or 1
     max_workers = max(1, total_cpus // threads)
-    logging.info(
+
+    logging.basicConfig(
+        filename="log.txt",
+        level=logging.INFO,
+        format="%(asctime)s — %(levelname)s — %(message)s",
+    )
+
+    logger.info(
         "Total CPUs=%d → threads per worker=%d → workers=%d",
         total_cpus,
         threads,
         max_workers,
-    )
-
-    logging.basicConfig(
-        level=logging.INFO, format="%(asctime)s — %(levelname)s — %(message)s"
     )
     combos = [
         (ds, ne, md, sd, threads)
@@ -189,7 +197,7 @@ def run_experiments(threads: int) -> None:
             # params = futures[fut]
             # try:
             # except Exception as e:
-            #    logging.error("Failed %s: %s", params, e)
+            #    logger.error("Failed %s: %s", params, e)
             # else:
             res = fut.result()
             # all_results.append(res)
@@ -197,7 +205,7 @@ def run_experiments(threads: int) -> None:
             print()
 
     # Path("results.json").write_text(json.dumps(all_results, indent=2))
-    # logging.info("Done — wrote %d results to results.json", len(all_results))
+    # logger.info("Done — wrote %d results to results.json", len(all_results))
 
 
 def main() -> int:
@@ -220,3 +228,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+    logger.info("Experiment completed successfully.")

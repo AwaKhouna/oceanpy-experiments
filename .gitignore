@@ -131,6 +131,7 @@ celerybeat.pid
 .env
 .venv
 env/
+tenv/
 venv/
 ENV/
 env.bak/
@@ -176,4 +177,5 @@ cython_debug/
 
 # Local configuration files
 datasets/
-results.json
+results*
+log.txt
