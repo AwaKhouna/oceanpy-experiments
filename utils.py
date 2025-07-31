@@ -21,7 +21,9 @@ def parse_dataset(
     Returns:
         pd.DataFrame: Parsed dataset.
     """
-    dataset_path = f"{URL}/{dataset}/{dataset}.csv?raw=true"
+    path = "datasets"
+    # dataset_path = f"{URL}/{dataset}/{dataset}.csv?raw=true"
+    dataset_path = f"{path}/{dataset}.csv"
     data = pd.read_csv(dataset_path, header=[0, 1])
     types: pd.Index[str] = data.columns.get_level_values(1)
     columns: pd.Index[str] = data.columns.get_level_values(0)

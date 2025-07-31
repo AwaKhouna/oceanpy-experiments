@@ -142,6 +142,20 @@ def run_experiment(
     return out
 
 
+def save_results(
+    results: List[Dict[str, Any]],
+    dataset: str,
+) -> None:
+    results_path = Path(f"results_{dataset}.json")
+    new_res: List[Dict[str, Any]] = []
+    if results_path.exists():
+        with open(results_path, "r") as f:
+            new_res += json.load(f)
+    new_res.append(results)
+    results_path.write_text(json.dumps(new_res, indent=2))
+    logging.info("Results saved to %s", results_path)
+
+
 def run_experiments(threads: int) -> None:
     set_thread_envvars(threads)
 
@@ -165,7 +179,7 @@ def run_experiments(threads: int) -> None:
         for sd in SEEDS
     ]
 
-    all_results: List[Dict[str, Any]] = []
+    # all_results: List[Dict[str, Any]] = []
     with ProcessPoolExecutor(max_workers=max_workers) as execu:
         futures = {
             execu.submit(run_experiment, ds, ne, md, sd, threads): (ds, ne, md, sd)
@@ -177,10 +191,13 @@ def run_experiments(threads: int) -> None:
             # except Exception as e:
             #    logging.error("Failed %s: %s", params, e)
             # else:
-            all_results.append(fut.result())
+            res = fut.result()
+            # all_results.append(res)
+            save_results(res, res["dataset"])
+            print()
 
-    Path("results.json").write_text(json.dumps(all_results, indent=2))
-    logging.info("Done — wrote %d results to results.json", len(all_results))
+    # Path("results.json").write_text(json.dumps(all_results, indent=2))
+    # logging.info("Done — wrote %d results to results.json", len(all_results))
 
 
 def main() -> int:
@@ -189,7 +206,7 @@ def main() -> int:
         "--threads",
         "-t",
         type=int,
-        default=1,
+        default=3,
         help="CPUs per worker process (default: 1)",
     )
     args = parser.parse_args()
