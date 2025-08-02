@@ -40,6 +40,26 @@ def set_thread_envvars(threads: int) -> None:
         os.environ[var] = str(threads)
 
 
+def check_experiment(
+    dataset: str, n_estimators: int, max_depth: int, seed: int
+) -> bool:
+    results_path = Path(f"results/{dataset}.json")
+    if not results_path.exists():
+        return False
+
+    with open(results_path, "r") as f:
+        results = json.load(f)
+
+    for res in results:
+        if (
+            res["n_estimators"] == n_estimators
+            and res["max_depth"] == max_depth
+            and res["seed"] == seed
+        ):
+            return True
+    return False
+
+
 def make_explainer(
     model: Any, mapper: Any, explainer_type: str, seed: int, threads: int
 ) -> Any:
@@ -185,8 +205,9 @@ def run_experiments(threads: int) -> None:
         for ne in N_ESTIMATORS
         for md in MAX_DEPTHS
         for sd in SEEDS
+        if not check_experiment(ds, ne, md, sd)
     ]
-
+    print(f"Running {len(combos)} experiments with {threads} threads each...")
     # all_results: List[Dict[str, Any]] = []
     with ProcessPoolExecutor(max_workers=max_workers) as execu:
         futures = {
