@@ -178,4 +178,6 @@ cython_debug/
 # Local configuration files
 datasets/
 results*
+plots/
 log.txt
+.DS_Store

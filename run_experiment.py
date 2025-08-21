@@ -6,12 +6,12 @@ import time
 import logging
 import argparse
 from pathlib import Path
-from typing import Any, Dict, List
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from typing import Any, Dict, List, Tuple
 import gurobipy as gp
 import numpy as np
 import pandas as pd
-
+import ortools.sat.python.cp_model as _cp
+import ortools
 from parameters import (
     DATASETS,
     SEEDS,
@@ -21,12 +21,25 @@ from parameters import (
     TIMEOUT,
     N_SAMPLES,
 )
-from utils import train_model, parse_dataset
+from utils import train_model, parse_dataset, get_split_levels, get_node_count
 from ocean import MixedIntegerProgramExplainer, ConstraintProgrammingExplainer
 import warnings
 
 warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")
 logger = logging.getLogger(__name__)
+
+## For compatibility with ortools 9.10 and earlier versions
+if ortools.__version__ < "9.11":
+    _orig_sum = _cp.LinearExpr.Sum
+
+    def _sum_wrapper(*args):
+        # If they passed one iterable, call it directly; else pack varargs into a list
+        if len(args) == 1 and hasattr(args[0], "__iter__"):
+            return _orig_sum(args[0])
+        else:
+            return _orig_sum(list(args))
+
+    _cp.LinearExpr.Sum = _sum_wrapper
 
 
 def set_thread_envvars(threads: int) -> None:
@@ -43,7 +56,8 @@ def set_thread_envvars(threads: int) -> None:
 def check_experiment(
     dataset: str, n_estimators: int, max_depth: int, seed: int
 ) -> bool:
-    results_path = Path(f"results/{dataset}.json")
+    filename = f"exp_{dataset}_{n_estimators}_{max_depth}_{seed}.json"
+    results_path = Path(f"results/{filename}")
     if not results_path.exists():
         return False
 
@@ -60,44 +74,55 @@ def check_experiment(
     return False
 
 
-def make_explainer(
-    model: Any, mapper: Any, explainer_type: str, seed: int, threads: int
-) -> Any:
+def make_explainer(model: Any, mapper: Any, explainer_type: str) -> Any:
+    t0 = time.time()
     if explainer_type == "cp":
-        exp = ConstraintProgrammingExplainer(
-            model,
-            mapper=mapper,
-            max_time=TIMEOUT,
-            seed=seed,
-            n_threads=threads,
-        )
-        return exp
+        exp = ConstraintProgrammingExplainer(model, mapper=mapper)
 
     elif explainer_type == "mip":
         env = gp.Env(empty=True)
         env.setParam("OutputFlag", 0)
-        env.setParam("TimeLimit", TIMEOUT)
-        env.setParam("Seed", seed)
-        env.setParam("Threads", threads)
         env.start()
-        return MixedIntegerProgramExplainer(model, mapper=mapper, env=env)
+        exp = MixedIntegerProgramExplainer(model, mapper=mapper, env=env)
 
     else:
         raise ValueError(f"Unknown explainer type: {explainer_type}")
+    build_time = time.time() - t0
+    return exp, build_time
 
 
 def explain_one(
     query: np.ndarray,
     y: int,
     explainer: MixedIntegerProgramExplainer | ConstraintProgrammingExplainer,
+    seed: int,
+    threads: int,
 ) -> Dict[str, Any]:
     t0 = time.time()
 
     if hasattr(explainer, "solver"):  # CPExp
-        explainer.explain(query, y=y, norm=1, save_callback=True)
+        explainer.explain(
+            query,
+            y=y,
+            norm=1,
+            return_callback=True,
+            max_time=TIMEOUT,
+            random_seed=seed,
+            num_workers=threads,
+            verbose=False,
+        )
         status = explainer.solver.status_name()
     else:  # MIPExp
-        explainer.explain(query, y=y, norm=1, return_callback=True)
+        explainer.explain(
+            query,
+            y=y,
+            norm=1,
+            return_callback=True,
+            max_time=TIMEOUT,
+            random_seed=seed,
+            num_workers=threads,
+            verbose=False,
+        )
         status = explainer.Status
     explainer.cleanup()
 
@@ -116,7 +141,7 @@ def get_performance_metrics(
     seed: int,
     threads: int,
 ) -> List[Dict[str, Any]]:
-    explainer = make_explainer(model, mapper, explainer_type, seed, threads)
+    explainer, build_time = make_explainer(model, mapper, explainer_type)
     metrics: List[Dict[str, Any]] = []
     test_data = (
         data.sample(n=N_SAMPLES, random_state=seed) if N_SAMPLES < len(data) else data
@@ -124,9 +149,9 @@ def get_performance_metrics(
     for i in test_data.index:
         q = test_data.loc[i].to_numpy().flatten()
         y = 1 - model.predict([q])[0]
-        res = explain_one(q, y, explainer)
+        res = explain_one(q, y, explainer, seed=seed, threads=threads)
         metrics.append(res)
-    return metrics
+    return metrics, build_time
 
 
 def run_experiment(
@@ -146,7 +171,6 @@ def run_experiment(
     )
 
     (X, y), mapper = parse_dataset(dataset_path, return_mapper=True)
-
     model = train_model(
         X, y, n_estimators=n_estimators, max_depth=max_depth, seed=seed, n_jobs=threads
     )
@@ -155,23 +179,30 @@ def run_experiment(
         "dataset": dataset_path,
         "n_estimators": n_estimators,
         "max_depth": max_depth,
+        "split_levels": get_split_levels(model),
+        "nodes": get_node_count(model),
         "seed": seed,
         "threads": threads,
         "accuracy": acc,
+        "n_features": X.shape[1],
         "explanations": {},
     }
     for expl_type in MODELS:
-        out["explanations"][expl_type] = get_performance_metrics(
+        metrics, build_time = get_performance_metrics(
             model, X, mapper, expl_type, seed, threads
         )
+        out["explanations"][expl_type] = {
+            "build_time": build_time,
+            "metrics": metrics,
+        }
     return out
 
 
 def save_results(
     results: List[Dict[str, Any]],
-    dataset: str,
+    filename: str,
 ) -> None:
-    results_path = Path(f"results/{dataset}.json")
+    results_path = Path(f"results/{filename}")
     new_res: List[Dict[str, Any]] = []
     if results_path.exists():
         with open(results_path, "r") as f:
@@ -181,11 +212,17 @@ def save_results(
     logger.info("Results saved to %s", results_path)
 
 
-def run_experiments(threads: int) -> None:
-    set_thread_envvars(threads)
+def get_experiment_params(id: int) -> Tuple[str, int, int, int | None]:
+    sd = SEEDS[0]
+    ds = DATASETS[id // (len(N_ESTIMATORS) * len(MAX_DEPTHS))]
+    ne = N_ESTIMATORS[(id // len(MAX_DEPTHS)) % len(N_ESTIMATORS)]
+    md = MAX_DEPTHS[id % len(MAX_DEPTHS)]
+    return ds, ne, md, sd
 
-    total_cpus = os.cpu_count() or 1
-    max_workers = max(1, total_cpus // threads)
+
+def run_experiments(experiment_id: int = 1) -> None:
+    threads = os.cpu_count()
+    set_thread_envvars(threads)
 
     logging.basicConfig(
         filename="log.txt",
@@ -194,56 +231,45 @@ def run_experiments(threads: int) -> None:
     )
 
     logger.info(
-        "Total CPUs=%d → threads per worker=%d → workers=%d",
-        total_cpus,
+        "Total CPUs=%d",
         threads,
-        max_workers,
     )
-    combos = [
-        (ds, ne, md, sd, threads)
-        for ds in DATASETS
-        for ne in N_ESTIMATORS
-        for md in MAX_DEPTHS
-        for sd in SEEDS
-        if not check_experiment(ds, ne, md, sd)
-    ]
-    print(f"Running {len(combos)} experiments with {threads} threads each...")
-    # all_results: List[Dict[str, Any]] = []
-    with ProcessPoolExecutor(max_workers=max_workers) as execu:
-        futures = {
-            execu.submit(run_experiment, ds, ne, md, sd, threads): (ds, ne, md, sd)
-            for ds, ne, md, sd, _ in combos
-        }
-        for fut in as_completed(futures):
-            # params = futures[fut]
-            # try:
-            # except Exception as e:
-            #    logger.error("Failed %s: %s", params, e)
-            # else:
-            res = fut.result()
-            # all_results.append(res)
-            save_results(res, res["dataset"])
-            print()
+
+    ds, ne, md, sd = get_experiment_params(experiment_id)
+    if check_experiment(ds, ne, md, sd):
+        logger.info("Experiment %d already completed", experiment_id)
+        return
+    print(
+        f"Running experiment {experiment_id} with dataset {ds},",
+        f" n_estimators={ne}, max_depth={md}, seed={sd}, threads={threads}",
+    )
+    res = run_experiment(
+        dataset_path=ds, n_estimators=ne, max_depth=md, seed=sd, threads=threads
+    )
+    filename = f"exp_{ds}_{ne}_{md}_{sd}.json"
+    save_results(res, filename=filename)
 
     # Path("results.json").write_text(json.dumps(all_results, indent=2))
-    # logger.info("Done — wrote %d results to results.json", len(all_results))
+    logger.info(f"Experiment {experiment_id} is done — wrote results to {filename}")
 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--threads",
-        "-t",
+        "--experiment",
+        "-e",
         type=int,
-        default=3,
-        help="CPUs per worker process (default: 1)",
+        default=1,
+        help="Experiment ID (default: 1, between 1 and 90)",
     )
+
     args = parser.parse_args()
+    if not (1 <= args.experiment <= 90):
+        raise ValueError(
+            f"Experiment ID must be between 1 and 90, got {args.experiment}"
+        )
 
-    if os.cpu_count() and args.threads > os.cpu_count():
-        parser.error(f"--threads ({args.threads}) > available CPUs ({os.cpu_count()})")
-
-    run_experiments(args.threads)
+    run_experiments(args.experiment - 1)
     return 0
 
 

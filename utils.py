@@ -2,9 +2,10 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import accuracy_score
 import pandas as pd
 from ocean.feature import parse_features
+from typing import Dict, List
 
 
-URL = "https://github.com/eminyous/ocean-datasets/blob/main"
+# URL = "https://github.com/eminyous/ocean-datasets/blob/main"
 
 
 def parse_dataset(
@@ -79,6 +80,49 @@ def train_model(
         return model, accuracy
 
     return model
+
+
+def get_split_levels(model: RandomForestClassifier) -> Dict[str, int]:
+    """
+    Get the split levels of the trees in the random forest model.
+
+    Args:
+        model (RandomForestClassifier): Trained random forest model.
+
+    Returns:
+        List[]: List of split levels for each tree.
+    """
+    splits = {}
+    for clf in model.estimators_:
+        n_nodes = clf.tree_.node_count
+        feature = clf.tree_.feature  # Array of feature indices for each node
+        threshold = clf.tree_.threshold  # Array of thresholds for each node
+
+        for node_idx in range(n_nodes):
+            # Ignore leaf nodes (feature index == -2)
+            if feature[node_idx] != -2:
+                feat_idx = feature[node_idx]
+                thresh = threshold[node_idx]
+                if feat_idx not in splits:
+                    splits[feat_idx] = set()  # Use a set to store unique thresholds
+                splits[feat_idx].add(thresh)
+
+    # Convert sets to counts
+    splits = {str(feat): int(len(thresh_set)) for feat, thresh_set in splits.items()}
+    return splits
+
+
+def get_node_count(model: RandomForestClassifier) -> List[int]:
+    """
+    Get the number of nodes in each tree of the random forest model.
+
+    Args:
+        model (RandomForestClassifier): Trained random forest model.
+
+    Returns:
+        List[int]: List of node counts for each tree.
+    """
+    return [clf.tree_.node_count for clf in model.estimators_]
 
 
 def test_functions():
