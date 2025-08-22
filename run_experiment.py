@@ -220,8 +220,11 @@ def get_experiment_params(id: int) -> Tuple[str, int, int, int | None]:
     return ds, ne, md, sd
 
 
-def run_experiments(experiment_id: int = 1) -> None:
-    threads = os.cpu_count()
+def run_experiments(experiment_id: int = 1, threads: int = 1) -> None:
+    if threads > os.cpu_count():
+        raise ValueError(
+            f"Requested {threads} threads, but only {os.cpu_count()} are available."
+        )
     set_thread_envvars(threads)
 
     logging.basicConfig(
@@ -262,6 +265,13 @@ def main() -> int:
         default=1,
         help="Experiment ID (default: 1, between 1 and 90)",
     )
+    parser.add_argument(
+        "--threads",
+        "-t",
+        type=int,
+        default=1,
+        help="Number of threads (default: 1)",
+    )
 
     args = parser.parse_args()
     if not (1 <= args.experiment <= 90):
@@ -269,7 +279,7 @@ def main() -> int:
             f"Experiment ID must be between 1 and 90, got {args.experiment}"
         )
 
-    run_experiments(args.experiment - 1)
+    run_experiments(args.experiment - 1, args.threads)
     return 0
 
 

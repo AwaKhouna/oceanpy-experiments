@@ -181,3 +181,5 @@ results*
 plots/
 log.txt
 .DS_Store
+outputs/
+*.zip
