@@ -97,11 +97,12 @@ def explain_one(
     explainer: MixedIntegerProgramExplainer | ConstraintProgrammingExplainer,
     seed: int,
     threads: int,
+    model: Any,
 ) -> Dict[str, Any]:
     t0 = time.time()
 
     if hasattr(explainer, "solver"):  # CPExp
-        explainer.explain(
+        cf = explainer.explain(
             query,
             y=y,
             norm=1,
@@ -113,7 +114,7 @@ def explain_one(
         )
         status = explainer.solver.status_name()
     else:  # MIPExp
-        explainer.explain(
+        cf = explainer.explain(
             query,
             y=y,
             norm=1,
@@ -124,12 +125,15 @@ def explain_one(
             verbose=False,
         )
         status = explainer.Status
-    explainer.cleanup()
 
     return {
         "status": status,
         "time": time.time() - t0,
         "callback": explainer.callback.sollist,
+        "valid": int(y) == int(model.predict([cf.to_numpy()])[0])
+        if cf is not None
+        else None,
+        "target": int(y),
     }
 
 
@@ -149,7 +153,7 @@ def get_performance_metrics(
     for i in test_data.index:
         q = test_data.loc[i].to_numpy().flatten()
         y = 1 - model.predict([q])[0]
-        res = explain_one(q, y, explainer, seed=seed, threads=threads)
+        res = explain_one(q, y, explainer, seed=seed, threads=threads, model=model)
         metrics.append(res)
     return metrics, build_time
 

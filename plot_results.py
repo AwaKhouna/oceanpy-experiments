@@ -2,10 +2,13 @@ import json
 import matplotlib.pyplot as plt
 import numpy as np
 from parameters import N_ESTIMATORS, MAX_DEPTHS
+from itertools import zip_longest
+
+ADD_BUILD_TIME = True
 
 
 def load_times(
-    filename: str,
+    dataset: str,
     n_estimators: int | None = None,
     max_depth: int | None = 0,
     seed: int | None = None,
@@ -14,8 +17,15 @@ def load_times(
     Load JSON and return two lists: cp_times, mip_times,
     one entry per instance.
     """
-    with open(filename, "r") as f:
-        data = json.load(f)
+    data = []
+    for n in N_ESTIMATORS:
+        for d in MAX_DEPTHS:
+            filename = f"results/results/exp_{dataset}_{n}_{d}_2.json"
+            try:
+                with open(filename, "r") as f:
+                    data += json.load(f)
+            except FileNotFoundError:
+                print(f"File not found: {filename}")
     if n_estimators is not None or max_depth != 0 or seed is not None:
         data = [
             item
@@ -30,20 +40,22 @@ def load_times(
         f"Loaded {len(data)} instances for n_estimators={n_estimators}, max_depth={max_depth}, seed={seed}"
     )
     for item in data:
-        cp_list = item["explanations"]["cp"]
-        mip_list = item["explanations"]["mip"]
+        cp_list = item["explanations"]["cp"]["metrics"]
+        mip_list = item["explanations"]["mip"]["metrics"]
+        cp_build = item["explanations"]["cp"]["build_time"] * ADD_BUILD_TIME
+        mip_build = item["explanations"]["mip"]["build_time"] * ADD_BUILD_TIME
         if len(cp_list) != len(mip_list):
             raise ValueError(
                 f"Instance count mismatch: cp has {len(cp_list)}, mip has {len(mip_list)}"
             )
         for cp_e, mip_e in zip(cp_list, mip_list):
-            cp_times.append(cp_e["time"])
-            mip_times.append(mip_e["time"])
+            cp_times.append(cp_e["time"] + cp_build)
+            mip_times.append(mip_e["time"] + mip_build)
     return np.array(cp_times), np.array(mip_times)
 
 
 def load_callbacks(
-    filename: str,
+    dataset: str,
     n_estimators: int = None,
     max_depth: int = None,
     seed: int = None,
@@ -52,8 +64,15 @@ def load_callbacks(
     Load JSON and return two lists: cp_distances, mip_distances,
     one entry per instance.
     """
-    with open(filename, "r") as f:
-        data = json.load(f)
+    data = []
+    for n in N_ESTIMATORS:
+        for d in MAX_DEPTHS:
+            filename = f"results/results/exp_{dataset}_{n}_{d}_2.json"
+            try:
+                with open(filename, "r") as f:
+                    data += json.load(f)
+            except FileNotFoundError:
+                print(f"File not found: {filename}")
     if n_estimators is not None or max_depth is not None or seed is not None:
         data = [
             item
@@ -65,8 +84,10 @@ def load_callbacks(
     cp_callbacks = []
     mip_callbacks = []
     for item in data:
-        cp_list = item["explanations"]["cp"]
-        mip_list = item["explanations"]["mip"]
+        cp_list = item["explanations"]["cp"]["metrics"]
+        mip_list = item["explanations"]["mip"]["metrics"]
+        cp_build = item["explanations"]["cp"]["build_time"] * ADD_BUILD_TIME
+        mip_build = item["explanations"]["mip"]["build_time"] * ADD_BUILD_TIME
         if len(cp_list) != len(mip_list):
             raise ValueError(
                 f"Instance count mismatch: cp has {len(cp_list)}, mip has {len(mip_list)}"
@@ -75,12 +96,23 @@ def load_callbacks(
             cp_cb = cp_e.get("callback", [])
             mip_cb = mip_e.get("callback", [])
             cp_cb.append(
-                {"objective_value": cp_cb[-1]["objective_value"], "time": cp_e["time"]}
+                {
+                    "objective_value": cp_cb[-1]["objective_value"]
+                    if len(cp_cb) > 0
+                    else None,
+                    "time": cp_e["time"] + cp_build
+                    if len(cp_cb) > 0 and cp_e["status"] == "OPTIMAL"
+                    else None,
+                },
             )
             mip_cb.append(
                 {
-                    "objective_value": mip_cb[-1]["objective_value"],
-                    "time": mip_e["time"],
+                    "objective_value": mip_cb[-1]["objective_value"]
+                    if len(mip_cb) > 0
+                    else None,
+                    "time": mip_e["time"] + mip_build
+                    if len(mip_cb) > 0 and mip_e["status"] == 2
+                    else None,
                 }
             )
             cp_callbacks.append(cp_cb)
@@ -103,48 +135,112 @@ def load_callbacks(
 def aggregate_callbacks(
     cp_callbacks: list[dict],
     mip_callbacks: list[dict],
-) -> tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
-    Normalize the distances for each instance and interpolate them on a common time grid.
-    and return:
-        - cp_mean_distances 1D : shape (,T)
-        - cp_std_distances 1D : shape (,T)
-        - mip_mean_distances 1D : shape (,T)
-        - mip_std_distances 1D : shape (,T)
-        - common_times 1D : shape (,T)
+    Normalize distances for each instance and interpolate them on a common time grid.
+    Returns:
+        cp_mean_distances, cp_std_distances, mip_mean_distances, mip_std_distances, common_times
+        each with shape (T,)
+    Notes:
+      - Instances with empty callbacks are ignored in the mean/std (via NaNs).
+      - Single-point series are treated as constant across time.
+      - Extrapolation at the ends is flat (holds endpoint values).
     """
-    cp_distances = []
-    mip_distances = []
     all_times = set()
-    for cp_cb, mip_cb in zip(cp_callbacks, mip_callbacks):
-        cp_times = [entry["time"] for entry in cp_cb]
-        mip_times = [entry["time"] for entry in mip_cb]
-        all_times.update(cp_times)
-        all_times.update(mip_times)
-    common_times = np.sort(np.array(list(all_times)))
-    for cp_cb, mip_cb in zip(cp_callbacks, mip_callbacks):
-        cp_distances.append([entry["objective_value"] for entry in cp_cb])
-        mip_distances.append([entry["objective_value"] for entry in mip_cb])
-    cp_interp = []
-    mip_interp = []
-    for cp_cb, mip_cb in zip(cp_callbacks, mip_callbacks):
-        cp_times = [entry["time"] for entry in cp_cb]
-        mip_times = [entry["time"] for entry in mip_cb]
-        cp_values = [entry["objective_value"] for entry in cp_cb]
-        mip_values = [entry["objective_value"] for entry in mip_cb]
-        cp_interp.append(np.interp(common_times, cp_times, cp_values))
-        mip_interp.append(np.interp(common_times, mip_times, mip_values))
-    cp_interp = np.array(cp_interp)
-    mip_interp = np.array(mip_interp)
-    # normalize cp_interp and mip_interp
-    cp_interp = cp_interp - cp_interp.min(axis=1, keepdims=True)
-    mip_interp = mip_interp - mip_interp.min(axis=1, keepdims=True)
-    cp_interp /= cp_interp.max(axis=1, keepdims=True) + 1e-10
-    mip_interp /= mip_interp.max(axis=1, keepdims=True) + 1e-10
-    cp_mean_distances = np.mean(cp_interp, axis=0)
-    cp_std_distances = np.std(cp_interp, axis=0)
-    mip_mean_distances = np.mean(mip_interp, axis=0)
-    mip_std_distances = np.std(mip_interp, axis=0)
+    for cb in cp_callbacks:
+        if cb:
+            all_times.update(entry["time"] for entry in cb)
+    for cb in mip_callbacks:
+        if cb:
+            all_times.update(entry["time"] for entry in cb)
+
+    common_times = (
+        np.sort(np.fromiter(all_times, dtype=float))
+        if all_times
+        else np.array([], dtype=float)
+    )
+
+    if common_times.size == 0:
+        return (np.array([]), np.array([]), np.array([]), np.array([]), common_times)
+
+    def interp_or_fill(cb: list[dict], times: np.ndarray) -> np.ndarray:
+        """Interpolate one callback onto `times` with robust edge handling."""
+        if not cb:
+            return np.full(times.shape, np.nan)
+
+        xs = np.fromiter((e["time"] for e in cb), dtype=float)
+        ys = np.fromiter((e["objective_value"] for e in cb), dtype=float)
+
+        if xs.size == 1:  # constant series
+            return np.full(times.shape, ys[0])
+
+        order = np.argsort(xs)
+        xs = xs[order]
+        ys = ys[order]
+
+        return np.interp(times, xs, ys, left=ys[0], right=ys[-1])
+
+    cp_rows = []
+    mip_rows = []
+    for cp_cb, mip_cb in zip_longest(cp_callbacks, mip_callbacks, fillvalue=None):
+        cp_rows.append(interp_or_fill(cp_cb or [], common_times))
+        mip_rows.append(interp_or_fill(mip_cb or [], common_times))
+
+    cp_interp = np.vstack(cp_rows)  # shape (N, T)
+    mip_interp = np.vstack(mip_rows)
+
+    def joint_normalize(
+        cp_interp: np.ndarray,
+        mip_interp: np.ndarray,
+        mode: str = "global",
+    ) -> tuple[np.ndarray, np.ndarray]:
+        cp = cp_interp.copy()
+        mip = mip_interp.copy()
+
+        if mode not in {"pairwise", "global"}:
+            raise ValueError("mode must be 'pairwise' or 'global'")
+
+        if mode == "pairwise":
+            # compute per-row mins/maxs over the union of the pair
+            mins = np.nanmin(
+                np.dstack([cp, mip]), axis=(1, 2), keepdims=True
+            )  # shape (N,1,1)
+            maxs = np.nanmax(np.dstack([cp, mip]), axis=(1, 2), keepdims=True)
+            # broadcast to row shape
+            mins = np.repeat(mins, cp.shape[1], axis=1)
+            maxs = np.repeat(maxs, cp.shape[1], axis=1)
+
+        else:  # global
+            global_min = np.nanmin([np.nanmin(cp), np.nanmin(mip)])
+            global_max = np.nanmax([np.nanmax(cp), np.nanmax(mip)])
+            mins = np.full_like(cp, global_min)
+            maxs = np.full_like(cp, global_max)
+
+        maxs = np.squeeze(maxs, axis=-1)
+        mins = np.squeeze(mins, axis=-1)
+        rng = maxs - mins
+        # safe range: if rng==0 (or NaN), set to 1 to avoid div-by-zero; we’ll handle all-NaN rows next
+        safe_rng = np.where(np.isfinite(rng) & (rng > 0), rng, 1.0)
+        cp_norm = (cp - mins) / safe_rng
+        mip_norm = (mip - mins) / safe_rng  # same mins/maxs applied to both
+
+        # keep rows that are all-NaN as NaN (no valid data in either CP or MIP)
+        # a row is all-NaN if both cp and mip were all-NaN originally
+        cp_all_nan = np.all(~np.isfinite(cp), axis=1)
+        mip_all_nan = np.all(~np.isfinite(mip), axis=1)
+        both_all_nan = cp_all_nan & mip_all_nan
+        cp_norm[both_all_nan, :] = np.nan
+        mip_norm[both_all_nan, :] = np.nan
+
+        return cp_norm, mip_norm
+
+    cp_norm, mip_norm = joint_normalize(cp_interp, mip_interp, mode="pairwise")
+
+    cp_mean_distances = np.nanmean(cp_norm, axis=0)
+    cp_std_distances = np.nanstd(cp_norm, axis=0)
+    mip_mean_distances = np.nanmean(mip_norm, axis=0)
+    mip_std_distances = np.nanstd(mip_norm, axis=0)
+
     return (
         cp_mean_distances,
         cp_std_distances,
@@ -180,7 +276,7 @@ def compute_performance_profile(
     return tau_vals, profile
 
 
-def plot_profile(tau, profile):
+def plot_profile(dataset, tau, profile):
     plt.figure(figsize=(6, 4))
     for method, rho in profile.items():
         plt.step(tau, rho, where="post", label=method)
@@ -192,11 +288,11 @@ def plot_profile(tau, profile):
     plt.grid(True, linestyle="--", alpha=0.5)
     plt.legend()
     plt.tight_layout()
-    plt.savefig("plots/profile.pdf")
+    plt.savefig(f"plots/{dataset}/profile.pdf")
     plt.close()
 
 
-def scatter_plot(cp_times, mip_times):
+def scatter_plot(dataset, cp_times, mip_times):
     plt.figure(figsize=(5, 5))
     plt.scatter(cp_times, mip_times, alpha=0.6)
     # tracer la diagonale y=x
@@ -209,11 +305,11 @@ def scatter_plot(cp_times, mip_times):
     plt.yscale("log")
     plt.grid(True, which="both", ls="--", alpha=0.5)
     plt.tight_layout()
-    plt.savefig("plots/scatter.pdf")
+    plt.savefig(f"plots/{dataset}/scatter.pdf")
     plt.close()
 
 
-def cactus_plot(cp_times, mip_times):
+def cactus_plot(dataset, cp_times, mip_times):
     plt.figure(figsize=(6, 4))
     N = len(cp_times)
     cp_sorted = np.sort(cp_times)
@@ -228,11 +324,11 @@ def cactus_plot(cp_times, mip_times):
     plt.legend()
     plt.grid(True, ls="--", alpha=0.5)
     plt.tight_layout()
-    plt.savefig("plots/cactus.pdf")
+    plt.savefig(f"plots/{dataset}/cactus.pdf")
     plt.close()
 
 
-def times_ratio(cp_times, mip_times):
+def times_ratio(dataset, cp_times, mip_times):
     ratios = cp_times / mip_times
     plt.figure(figsize=(6, 4))
     plt.hist(ratios, bins=30, alpha=0.7)
@@ -242,11 +338,11 @@ def times_ratio(cp_times, mip_times):
     plt.title("Histogramme des ratios de temps")
     plt.grid(True, ls="--", alpha=0.5)
     plt.tight_layout()
-    plt.savefig("plots/ratio_histogram.pdf")
+    plt.savefig(f"plots/{dataset}/ratio_histogram.pdf")
     plt.close()
 
 
-def cactus_cdf_plot(cp_times, mip_times):
+def cactus_cdf_plot(dataset, cp_times, mip_times):
     plt.figure(figsize=(6, 4))
     for times, name in [(cp_times, "cp"), (mip_times, "mip")]:
         ts = np.sort(times)
@@ -259,11 +355,12 @@ def cactus_cdf_plot(cp_times, mip_times):
     plt.grid(True, ls="--", alpha=0.5)
     plt.legend()
     plt.tight_layout()
-    plt.savefig("plots/cactus_cdf.pdf")
+    plt.savefig(f"plots/{dataset}/cactus_cdf.pdf")
     plt.close()
 
 
 def distance_plot(
+    dataset,
     cp_mean_distances,
     cp_std_distances,
     mip_mean_distances,
@@ -292,7 +389,7 @@ def distance_plot(
     # plt.xscale("log")
     plt.legend()
     plt.tight_layout()
-    plt.savefig("plots/distance_plot.pdf")
+    plt.savefig(f"plots/{dataset}/distance_plot.pdf")
     plt.close()
 
 
@@ -309,12 +406,12 @@ def remove_constant_parts(cp_mean_distances, mip_mean_distances):
     return cp_mean_distances, mip_mean_distances
 
 
-def estimators_distance_plot(filename: str, seed: int | None = None):
-    figure, ax = plt.subplots(figsize=(12, 8))
+def estimators_distance_plot(dataset: str, seed: int | None = None) -> None:
+    __cached__, ax = plt.subplots(figsize=(12, 8))
     colors = plt.cm.viridis(np.linspace(0, 1, len(N_ESTIMATORS)))
     for i, n_estimators in enumerate(N_ESTIMATORS[::-1]):
         cp_callbacks, mip_callbacks = load_callbacks(
-            filename, n_estimators=n_estimators, seed=seed
+            dataset, n_estimators=n_estimators, seed=seed
         )
         (
             cp_mean_distances,
@@ -347,20 +444,20 @@ def estimators_distance_plot(filename: str, seed: int | None = None):
     # ax.set_xscale("log")
     ax.legend()
     plt.tight_layout()
-    plt.savefig("plots/estimators_distance_plot.pdf")
+    plt.savefig(f"plots/{dataset}/estimators_distance_plot.pdf")
     plt.close()
 
 
 def depth_distance_plot(
-    filename: str,
+    dataset: str,
     n_estimators: int | None = None,
     seed: int | None = None,
-):
+) -> None:
     figure, ax = plt.subplots(figsize=(12, 8))
     colors = plt.cm.viridis(np.linspace(0, 1, len(MAX_DEPTHS)))
     for i, max_depth in enumerate(MAX_DEPTHS[::-1]):
         cp_callbacks, mip_callbacks = load_callbacks(
-            filename,
+            dataset,
             n_estimators=n_estimators,
             max_depth=max_depth,
             seed=seed,
@@ -396,16 +493,16 @@ def depth_distance_plot(
     ax.set_xscale("log")
     ax.legend()
     plt.tight_layout()
-    plt.savefig("plots/depth_distance_plot.pdf")
+    plt.savefig(f"plots/{dataset}/depth_distance_plot.pdf")
     plt.close()
 
 
 def plot_times_vs_anything(
-    filename: str,
+    dataset: str,
     n_estimators: int | None = None,
     max_depth: int | None = None,
     seed: int | None = None,
-):
+) -> None:
     vs_estimators = n_estimators is None
     if n_estimators is not None:
         VS = MAX_DEPTHS
@@ -426,7 +523,7 @@ def plot_times_vs_anything(
             n_estimators = n_estimators
             max_depth = vs
         cp_times, mip_times = load_times(
-            filename, n_estimators=n_estimators, max_depth=max_depth, seed=seed
+            dataset, n_estimators=n_estimators, max_depth=max_depth, seed=seed
         )
         # print(
         #    f"Loaded {len(cp_times)} instances for n_estimators={n_estimators}, max_depth={max_depth}"
@@ -468,24 +565,27 @@ def plot_times_vs_anything(
     plt.legend()
     plt.tight_layout()
     plt.savefig(
-        "plots/times_vs_" + ("estimators" if vs_estimators else "depth") + ".pdf"
+        f"plots/{dataset}/times_vs_"
+        + ("estimators" if vs_estimators else "depth")
+        + ".pdf"
     )
     plt.close()
 
 
-def main():
-    filename = "results/COMPAS1.json"
-    cp_times, mip_times = load_times(filename)
+def main() -> None:
+    dataset = "Credit"
+    cp_times, mip_times = load_times(dataset)
+    scatter_plot(dataset, cp_times, mip_times)
+    cactus_plot(dataset, cp_times, mip_times)
+    times_ratio(dataset, cp_times, mip_times)
+    cactus_cdf_plot(dataset, cp_times, mip_times)
+    print("First plots done!")
+
     times_dict = {"cp": cp_times, "mip": mip_times}
-    # scatter_plot(cp_times, mip_times)
-    # cactus_plot(cp_times, mip_times)
-    # times_ratio(cp_times, mip_times)
-    # cactus_cdf_plot(cp_times, mip_times)
-
     tau, profile = compute_performance_profile(times_dict)
-    plot_profile(tau, profile)
+    plot_profile(dataset, tau, profile)
 
-    cp_callbacks, mip_callbacks = load_callbacks(filename)
+    cp_callbacks, mip_callbacks = load_callbacks(dataset)
     (
         cp_mean_distances,
         cp_std_distances,
@@ -494,16 +594,17 @@ def main():
         common_times,
     ) = aggregate_callbacks(cp_callbacks, mip_callbacks)
     distance_plot(
+        dataset,
         cp_mean_distances,
         cp_std_distances,
         mip_mean_distances,
         mip_std_distances,
         common_times,
     )
-    # estimators_distance_plot(filename, seed=42)
-    # depth_distance_plot(filename, n_estimators=100)
-    # plot_times_vs_anything(filename, n_estimators=100)
-    # plot_times_vs_anything(filename, max_depth=5)
+    estimators_distance_plot(dataset, seed=2)
+    depth_distance_plot(dataset, n_estimators=200)
+    plot_times_vs_anything(dataset, n_estimators=200)
+    plot_times_vs_anything(dataset, max_depth=9)
 
 
 if __name__ == "__main__":
