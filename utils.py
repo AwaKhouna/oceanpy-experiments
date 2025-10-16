@@ -2,10 +2,11 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import accuracy_score
 import pandas as pd
 from ocean.feature import parse_features
-from typing import Dict, List
+from ocean.typing import BaseExplainableEnsemble
+from typing import Dict, List, Literal
+from xgboost import XGBClassifier
 
-
-# URL = "https://github.com/eminyous/ocean-datasets/blob/main"
+URL = "https://github.com/eminyous/ocean-datasets/blob/main"
 
 
 def parse_dataset(
@@ -22,9 +23,9 @@ def parse_dataset(
     Returns:
         pd.DataFrame: Parsed dataset.
     """
-    path = "datasets"
-    # dataset_path = f"{URL}/{dataset}/{dataset}.csv?raw=true"
-    dataset_path = f"{path}/{dataset}.csv"
+    # path = "datasets"
+    dataset_path = f"{URL}/{dataset}/{dataset}.csv?raw=true"
+    # dataset_path = f"{path}/{dataset}.csv"
     data = pd.read_csv(dataset_path, header=[0, 1])
     types: pd.Index[str] = data.columns.get_level_values(1)
     columns: pd.Index[str] = data.columns.get_level_values(0)
@@ -49,14 +50,14 @@ def parse_dataset(
 def train_model(
     data: pd.DataFrame,
     y: pd.Series,
+    model_type: Literal["rf", "xgb"] = "rf",
     n_estimators: int = 100,
     max_depth: int = None,
     seed: int = 42,
-    n_jobs: int = -1,
     return_accuracy: bool = False,
-) -> RandomForestClassifier | tuple[RandomForestClassifier, float]:
+) -> BaseExplainableEnsemble | tuple[BaseExplainableEnsemble, float]:
     """
-    Train a random forest model on the given dataset.
+    Train an ensemble on the given dataset.
 
     Args:
         data (pd.DataFrame): Dataset to train the model on.
@@ -64,14 +65,20 @@ def train_model(
         seed (int): Random seed for reproducibility.
 
     Returns:
-        RandomForestClassifier: Trained model.
+        BaseExplainableEnsemble: Trained model.
     """
-    model = RandomForestClassifier(
-        n_estimators=n_estimators,
-        max_depth=max_depth,
-        random_state=seed,
-        n_jobs=n_jobs,
-    )
+    if model_type == "rf":
+        model = RandomForestClassifier(
+            n_estimators=n_estimators,
+            max_depth=max_depth,
+            random_state=seed,
+        )
+    elif model_type == "xgb":
+        model = XGBClassifier(
+            n_estimators=n_estimators,
+            max_depth=max_depth,
+            random_state=seed,
+        )
     model.fit(data, y)
 
     if return_accuracy:
@@ -82,7 +89,23 @@ def train_model(
     return model
 
 
-def get_split_levels(model: RandomForestClassifier) -> Dict[str, int]:
+def get_split_levels(model: BaseExplainableEnsemble) -> Dict[str, int]:
+    """
+    Get the split levels of the trees in the ensemble model.
+    Args:
+        model (BaseExplainableEnsemble): Trained ensemble model.
+    Returns:
+        Dict[str, int]: Dictionary of split levels for each feature.
+    """
+    if isinstance(model, RandomForestClassifier):
+        return get_split_levels_rf(model)
+    elif isinstance(model, XGBClassifier):
+        return get_split_levels_xgb(model)
+    else:
+        raise ValueError(f"Unknown model type: {type(model)}")
+
+
+def get_split_levels_rf(model: RandomForestClassifier) -> Dict[str, int]:
     """
     Get the split levels of the trees in the random forest model.
 
@@ -112,7 +135,87 @@ def get_split_levels(model: RandomForestClassifier) -> Dict[str, int]:
     return splits
 
 
-def get_node_count(model: RandomForestClassifier) -> List[int]:
+def get_split_levels_xgb(model: XGBClassifier) -> Dict[str, int]:
+    """
+    Count the number of unique split conditions per feature across all trees
+    in an XGBClassifier. For numeric splits we count unique thresholds; for
+    categorical splits (if present) we count distinct split nodes.
+
+    Args:
+        model (xgb.XGBClassifier): Trained XGBoost classifier.
+
+    Returns:
+        Dict[str, int]: {feature_name: count_of_unique_splits}
+    """
+    booster = model.get_booster()
+    df = booster.trees_to_dataframe()
+
+    if df.empty:
+        return {}
+
+    # Keep only decision (non-leaf) nodes
+    df_nonleaf = df[df["Feature"] != "Leaf"].copy()
+    if df_nonleaf.empty:
+        return {}
+
+    counts: Dict[str, int] = {}
+
+    # Newer XGBoost adds "Decision Type" (e.g., "<=" for numeric, "==" for categorical)
+    if "Decision Type" in df_nonleaf.columns:
+        # Numeric splits: count unique thresholds per feature
+        num_mask = df_nonleaf["Decision Type"].astype(str).str.contains("<=")
+        if num_mask.any():
+            num_counts = df_nonleaf[num_mask].groupby("Feature")["Split"].nunique()
+            counts.update({str(k): int(v) for k, v in num_counts.to_dict().items()})
+
+        # Categorical splits (if used): count unique nodes per feature
+        cat_mask = df_nonleaf["Decision Type"].astype(str).str.contains("==")
+        if cat_mask.any():
+            cat_counts = df_nonleaf[cat_mask].groupby("Feature")["Node"].nunique()
+            for k, v in cat_counts.to_dict().items():
+                counts[str(k)] = int(counts.get(str(k), 0) + int(v))
+    else:
+        # Fallback for older versions: use presence/absence of "Split" values
+        if "Split" in df_nonleaf.columns:
+            num_counts = (
+                df_nonleaf[df_nonleaf["Split"].notna()]
+                .groupby("Feature")["Split"]
+                .nunique()
+                .to_dict()
+            )
+            counts.update({str(k): int(v) for k, v in num_counts.items()})
+
+        other_counts = (
+            df_nonleaf[df_nonleaf["Split"].isna()]
+            .groupby("Feature")["Node"]
+            .nunique()
+            .to_dict()
+        )
+        for k, v in other_counts.items():
+            counts[str(k)] = int(counts.get(str(k), 0) + int(v))
+
+    return counts
+
+
+def get_node_count(model: BaseExplainableEnsemble) -> List[int]:
+    """
+    Get the number of nodes in each tree of the ensemble model.
+
+    Args:
+        model (BaseExplainableEnsemble): Trained ensemble model.
+
+    Returns:
+        List[int]: List of node counts for each tree.
+    """
+    if isinstance(model, RandomForestClassifier):
+        return get_node_count_rf(model)
+    elif isinstance(model, XGBClassifier):
+        return get_node_count_xgb(model)
+    else:
+        raise ValueError(f"Unknown model type: {type(model)}")
+
+
+def get_node_count_rf(model: RandomForestClassifier) -> List[int]:
     """
     Get the number of nodes in each tree of the random forest model.
 
@@ -123,6 +226,23 @@ def get_node_count(model: RandomForestClassifier) -> List[int]:
         List[int]: List of node counts for each tree.
     """
     return [clf.tree_.node_count for clf in model.estimators_]
+
+
+def get_node_count_xgb(model: XGBClassifier) -> List[int]:
+    """
+    Get the total number of nodes in each tree of an XGBClassifier.
+
+    Args:
+        model (xgb.XGBClassifier): Trained XGBoost classifier.
+
+    Returns:
+        List[int]: Node counts for each tree (includes decision + leaf nodes).
+    """
+    booster = model.get_booster()
+    df = booster.trees_to_dataframe()
+    if df.empty:
+        return []
+    return df.groupby("Tree").size().astype(int).tolist()
 
 
 def test_functions():

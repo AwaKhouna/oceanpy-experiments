@@ -179,7 +179,7 @@ cython_debug/
 datasets/
 results*
 plots/
-log.txt
+log*.txt
 .DS_Store
 outputs/
 *.zip

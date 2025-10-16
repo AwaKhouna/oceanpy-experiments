@@ -6,7 +6,7 @@ import time
 import logging
 import argparse
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Tuple, Literal
 import gurobipy as gp
 import numpy as np
 import pandas as pd
@@ -21,9 +21,11 @@ from parameters import (
     TIMEOUT,
     N_SAMPLES,
 )
-from utils import train_model, parse_dataset, get_split_levels, get_node_count
+from utils import train_model, get_split_levels, get_node_count  # , parse_dataset
 from ocean import MixedIntegerProgramExplainer, ConstraintProgrammingExplainer
 import warnings
+from ocean.datasets import load_adult, load_compas, load_credit
+from ocean.typing import BaseExplainableEnsemble
 
 warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")
 logger = logging.getLogger(__name__)
@@ -42,6 +44,21 @@ if ortools.__version__ < "9.11":
     _cp.LinearExpr.Sum = _sum_wrapper
 
 
+def load_dataset(
+    dataset: str,
+    scale: bool = True,
+    return_mapper: bool = True,
+) -> Tuple[pd.DataFrame, pd.Series]:
+    if dataset == "COMPAS":
+        return load_compas(scale=scale, return_mapper=return_mapper)
+    elif dataset == "Adult":
+        return load_adult(scale=scale, return_mapper=return_mapper)
+    elif dataset == "Credit":
+        return load_credit(scale=scale, return_mapper=return_mapper)
+    else:
+        raise ValueError(f"Unknown dataset: {dataset}")
+
+
 def set_thread_envvars(threads: int) -> None:
     for var in (
         "OMP_NUM_THREADS",
@@ -54,9 +71,13 @@ def set_thread_envvars(threads: int) -> None:
 
 
 def check_experiment(
-    dataset: str, n_estimators: int, max_depth: int, seed: int
+    dataset: str,
+    n_estimators: int,
+    max_depth: int,
+    seed: int,
+    model_type: Literal["rf", "xgb"] = "rf",
 ) -> bool:
-    filename = f"exp_{dataset}_{n_estimators}_{max_depth}_{seed}.json"
+    filename = f"{model_type}/exp_{dataset}_{n_estimators}_{max_depth}_{seed}.json"
     results_path = Path(f"results/{filename}")
     if not results_path.exists():
         return False
@@ -74,7 +95,9 @@ def check_experiment(
     return False
 
 
-def make_explainer(model: Any, mapper: Any, explainer_type: str) -> Any:
+def make_explainer(
+    model: BaseExplainableEnsemble, mapper: Any, explainer_type: str
+) -> Any:
     t0 = time.time()
     if explainer_type == "cp":
         exp = ConstraintProgrammingExplainer(model, mapper=mapper)
@@ -100,40 +123,26 @@ def explain_one(
     model: Any,
 ) -> Dict[str, Any]:
     t0 = time.time()
-
-    if hasattr(explainer, "solver"):  # CPExp
-        cf = explainer.explain(
-            query,
-            y=y,
-            norm=1,
-            return_callback=True,
-            max_time=TIMEOUT,
-            random_seed=seed,
-            num_workers=threads,
-            verbose=False,
-        )
-        status = explainer.solver.status_name()
-    else:  # MIPExp
-        cf = explainer.explain(
-            query,
-            y=y,
-            norm=1,
-            return_callback=True,
-            max_time=TIMEOUT,
-            random_seed=seed,
-            num_workers=threads,
-            verbose=False,
-        )
-        status = explainer.Status
-
+    cf = explainer.explain(
+        query,
+        y=y,
+        norm=1,
+        return_callback=True,
+        max_time=TIMEOUT,
+        random_seed=seed,
+        num_workers=threads,
+        verbose=False,
+    )
+    status = explainer.get_solving_status()
+    explainer.cleanup()
     return {
         "status": status,
-        "time": time.time() - t0,
-        "callback": explainer.callback.sollist,
         "valid": int(y) == int(model.predict([cf.to_numpy()])[0])
         if cf is not None
         else None,
         "target": int(y),
+        "time": time.time() - t0,
+        "callback": explainer.callback.sollist,
     }
 
 
@@ -159,7 +168,12 @@ def get_performance_metrics(
 
 
 def run_experiment(
-    dataset_path: str, n_estimators: int, max_depth: int, seed: int, threads: int
+    dataset_path: str,
+    n_estimators: int,
+    max_depth: int,
+    seed: int,
+    threads: int,
+    model_type: Literal["rf", "xgb"] = "rf",
 ) -> Dict[str, Any]:
     logger.info(
         "Dataset=%s | n_estimators=%d | max_depth=%s | seed=%d | threads=%d",
@@ -174,13 +188,20 @@ def run_experiment(
         f"max_depth={max_depth}, seed={seed}, threads={threads}"
     )
 
-    (X, y), mapper = parse_dataset(dataset_path, return_mapper=True)
+    (X, y), mapper = load_dataset(dataset_path)
+    # parse_dataset(dataset_path, return_mapper=True)
     model = train_model(
-        X, y, n_estimators=n_estimators, max_depth=max_depth, seed=seed, n_jobs=threads
+        X,
+        y,
+        n_estimators=n_estimators,
+        max_depth=max_depth,
+        seed=seed,
+        model_type=model_type,
     )
     acc = model.score(X, y)
     out: Dict[str, Any] = {
         "dataset": dataset_path,
+        "model_type": model_type,
         "n_estimators": n_estimators,
         "max_depth": max_depth,
         "split_levels": get_split_levels(model),
@@ -224,15 +245,17 @@ def get_experiment_params(id: int) -> Tuple[str, int, int, int | None]:
     return ds, ne, md, sd
 
 
-def run_experiments(experiment_id: int = 1, threads: int = 1) -> None:
+def run_experiments(
+    experiment_id: int = 1, threads: int = 1, model_type: Literal["rf", "xgb"] = "rf"
+) -> None:
     if threads > os.cpu_count():
         raise ValueError(
             f"Requested {threads} threads, but only {os.cpu_count()} are available."
         )
-    set_thread_envvars(threads)
+    # set_thread_envvars(threads)
 
     logging.basicConfig(
-        filename="log.txt",
+        filename=f"log_{model_type}.txt",
         level=logging.INFO,
         format="%(asctime)s — %(levelname)s — %(message)s",
     )
@@ -243,7 +266,7 @@ def run_experiments(experiment_id: int = 1, threads: int = 1) -> None:
     )
 
     ds, ne, md, sd = get_experiment_params(experiment_id)
-    if check_experiment(ds, ne, md, sd):
+    if check_experiment(ds, ne, md, sd, model_type=model_type):
         logger.info("Experiment %d already completed", experiment_id)
         return
     print(
@@ -251,9 +274,14 @@ def run_experiments(experiment_id: int = 1, threads: int = 1) -> None:
         f" n_estimators={ne}, max_depth={md}, seed={sd}, threads={threads}",
     )
     res = run_experiment(
-        dataset_path=ds, n_estimators=ne, max_depth=md, seed=sd, threads=threads
+        dataset_path=ds,
+        n_estimators=ne,
+        max_depth=md,
+        seed=sd,
+        threads=threads,
+        model_type=model_type,
     )
-    filename = f"exp_{ds}_{ne}_{md}_{sd}.json"
+    filename = f"{model_type}/exp_{ds}_{ne}_{md}_{sd}.json"
     save_results(res, filename=filename)
 
     # Path("results.json").write_text(json.dumps(all_results, indent=2))
@@ -276,6 +304,14 @@ def main() -> int:
         default=1,
         help="Number of threads (default: 1)",
     )
+    parser.add_argument(
+        "--model-type",
+        "-m",
+        type=str,
+        choices=["rf", "xgb"],
+        default="rf",
+        help="Model type (default: rf)",
+    )
 
     args = parser.parse_args()
     if not (1 <= args.experiment <= 90):
@@ -283,7 +319,7 @@ def main() -> int:
             f"Experiment ID must be between 1 and 90, got {args.experiment}"
         )
 
-    run_experiments(args.experiment - 1, args.threads)
+    run_experiments(args.experiment - 1, args.threads, args.model_type)
     return 0
 
 
