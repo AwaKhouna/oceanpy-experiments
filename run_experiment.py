@@ -133,10 +133,10 @@ def explain_one(
         num_workers=threads,
         verbose=False,
     )
-    status = explainer.get_solving_status()
     explainer.cleanup()
     return {
-        "status": status,
+        "objective": explainer.get_objective_value(),
+        "status": explainer.get_solving_status(),
         "valid": int(y) == int(model.predict([cf.to_numpy()])[0])
         if cf is not None
         else None,
@@ -266,7 +266,7 @@ def run_experiments(
     )
 
     ds, ne, md, sd = get_experiment_params(experiment_id)
-    if check_experiment(ds, ne, md, sd, model_type=model_type):
+    if check_experiment(ds, ne, md, sd, model_type=model_type) and False:
         logger.info("Experiment %d already completed", experiment_id)
         return
     print(
