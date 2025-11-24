@@ -21,10 +21,10 @@ from parameters import (
     TIMEOUT,
     N_SAMPLES,
 )
-from utils import train_model, get_split_levels, get_node_count  # , parse_dataset
+from utils import train_model, get_split_levels, get_node_count, parse_dataset
 from ocean import MixedIntegerProgramExplainer, ConstraintProgrammingExplainer
 import warnings
-from ocean.datasets import load_adult, load_compas, load_credit
+# from ocean.datasets import load_adult, load_compas, load_credit
 from ocean.typing import BaseExplainableEnsemble
 
 warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")
@@ -49,14 +49,19 @@ def load_dataset(
     scale: bool = True,
     return_mapper: bool = True,
 ) -> Tuple[pd.DataFrame, pd.Series]:
-    if dataset == "COMPAS":
-        return load_compas(scale=scale, return_mapper=return_mapper)
-    elif dataset == "Adult":
-        return load_adult(scale=scale, return_mapper=return_mapper)
-    elif dataset == "Credit":
-        return load_credit(scale=scale, return_mapper=return_mapper)
-    else:
-        raise ValueError(f"Unknown dataset: {dataset}")
+    return parse_dataset(
+        dataset,
+        scale=scale,
+        return_mapper=return_mapper,
+    )
+    # if dataset == "COMPAS":
+    #     return load_compas(scale=scale, return_mapper=return_mapper)
+    # elif dataset == "Adult":
+    #     return load_adult(scale=scale, return_mapper=return_mapper)
+    # elif dataset == "Credit":
+    #     return load_credit(scale=scale, return_mapper=return_mapper)
+    # else:
+    #     raise ValueError(f"Unknown dataset: {dataset}")
 
 
 def set_thread_envvars(threads: int) -> None:
@@ -135,7 +140,7 @@ def explain_one(
     )
     explainer.cleanup()
     return {
-        "objective": explainer.get_objective_value(),
+        "objective": explainer.get_objective_value() if cf is not None else None,
         "status": explainer.get_solving_status(),
         "valid": int(y) == int(model.predict([cf.to_numpy()])[0])
         if cf is not None
@@ -266,7 +271,7 @@ def run_experiments(
     )
 
     ds, ne, md, sd = get_experiment_params(experiment_id)
-    if check_experiment(ds, ne, md, sd, model_type=model_type) and False:
+    if check_experiment(ds, ne, md, sd, model_type=model_type):
         logger.info("Experiment %d already completed", experiment_id)
         return
     print(

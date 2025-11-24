@@ -183,3 +183,6 @@ log*.txt
 .DS_Store
 outputs/
 *.zip
+*.sh
+count.py
+test_results.py
