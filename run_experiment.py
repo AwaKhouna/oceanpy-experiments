@@ -216,6 +216,7 @@ def run_experiment(
     max_depth: int,
     seed: int,
     threads: int,
+    filename: str,
     model_type: Literal["rf", "xgb"] = "rf",
 ) -> Dict[str, Any]:
     logger.info(
@@ -264,16 +265,18 @@ def run_experiment(
             "build_time": build_time,
             "metrics": metrics,
         }
+        save_results(out, filename=filename, overwrite=True)
     return out
 
 
 def save_results(
     results: List[Dict[str, Any]],
     filename: str,
+    overwrite: bool = False,
 ) -> None:
     results_path = Path(f"results/{filename}")
     new_res: List[Dict[str, Any]] = []
-    if results_path.exists():
+    if results_path.exists() and not overwrite:
         with open(results_path, "r") as f:
             new_res += json.load(f)
     new_res.append(results)
@@ -317,6 +320,7 @@ def run_experiments(
         f"Running experiment {experiment_id} with dataset {ds},",
         f" n_estimators={ne}, max_depth={md}, seed={sd}, threads={threads}",
     )
+    filename = f"{model_type}/exp_{ds}_{ne}_{md}_{sd}.json"
     res = run_experiment(
         dataset_path=ds,
         n_estimators=ne,
@@ -324,8 +328,8 @@ def run_experiments(
         seed=sd,
         threads=threads,
         model_type=model_type,
+        filename=filename,
     )
-    filename = f"{model_type}/exp_{ds}_{ne}_{md}_{sd}.json"
     save_results(res, filename=filename)
 
     # Path("results.json").write_text(json.dumps(all_results, indent=2))
