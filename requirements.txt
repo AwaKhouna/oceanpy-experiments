@@ -7,3 +7,4 @@ scikit-learn
 ucimlrepo
 setuptools
 xgboost
+tqdm

@@ -6,8 +6,6 @@ from ocean.typing import BaseExplainableEnsemble
 from typing import Dict, List, Literal
 from xgboost import XGBClassifier
 
-URL = "https://github.com/eminyous/ocean-datasets/blob/main"
-
 
 def parse_dataset(
     dataset: str,
@@ -24,7 +22,6 @@ def parse_dataset(
         pd.DataFrame: Parsed dataset.
     """
     path = "datasets"
-    # dataset_path = f"{URL}/{dataset}/{dataset}.csv?raw=true"
     dataset_path = f"{path}/{dataset}.csv"
     data = pd.read_csv(dataset_path, header=[0, 1])
     types: pd.Index[str] = data.columns.get_level_values(1)

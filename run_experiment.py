@@ -12,6 +12,7 @@ import numpy as np
 import pandas as pd
 import ortools.sat.python.cp_model as _cp
 import ortools
+from tqdm import tqdm
 from parameters import (
     DATASETS,
     SEEDS,
@@ -22,8 +23,13 @@ from parameters import (
     N_SAMPLES,
 )
 from utils import train_model, get_split_levels, get_node_count, parse_dataset
-from ocean import MixedIntegerProgramExplainer, ConstraintProgrammingExplainer
+from ocean import (
+    MixedIntegerProgramExplainer,
+    ConstraintProgrammingExplainer,
+    MaxSATExplainer,
+)
 import warnings
+
 # from ocean.datasets import load_adult, load_compas, load_credit
 from ocean.typing import BaseExplainableEnsemble
 
@@ -113,6 +119,9 @@ def make_explainer(
         env.start()
         exp = MixedIntegerProgramExplainer(model, mapper=mapper, env=env)
 
+    elif explainer_type == "maxsat":
+        exp = MaxSATExplainer(model, mapper=mapper)
+
     else:
         raise ValueError(f"Unknown explainer type: {explainer_type}")
     build_time = time.time() - t0
@@ -127,18 +136,38 @@ def explain_one(
     threads: int,
     model: Any,
 ) -> Dict[str, Any]:
+    is_maxsat_explainer: bool = explainer.Type == MaxSATExplainer.Type
     t0 = time.time()
-    cf = explainer.explain(
-        query,
-        y=y,
-        norm=1,
-        return_callback=True,
-        max_time=TIMEOUT,
-        random_seed=seed,
-        num_workers=threads,
-        verbose=False,
-    )
+    if is_maxsat_explainer:
+        cf = explainer.explain(
+            query,
+            y=y,
+            norm=1,
+            max_time=TIMEOUT,
+            random_seed=seed,
+            verbose=False,
+        )
+    else:
+        cf = explainer.explain(
+            query,
+            y=y,
+            norm=1,
+            return_callback=True,
+            max_time=TIMEOUT,
+            random_seed=seed,
+            num_workers=threads,
+            verbose=False,
+        )
     explainer.cleanup()
+    t_final = time.time() - t0
+    if is_maxsat_explainer:
+        sollist = (
+            []
+            if cf is None
+            else [{"objective": explainer.get_objective_value(), "time": t_final}]
+        )
+    else:
+        sollist = explainer.callback.sollist
     return {
         "objective": explainer.get_objective_value() if cf is not None else None,
         "status": explainer.get_solving_status(),
@@ -146,9 +175,18 @@ def explain_one(
         if cf is not None
         else None,
         "target": int(y),
-        "time": time.time() - t0,
-        "callback": explainer.callback.sollist,
+        "time": t_final,
+        "callback": sollist,
     }
+
+
+def choose_random_label(y: int, n_classes: int) -> int:
+    if n_classes == 2:
+        return 1 - y
+    else:
+        labels = list(range(n_classes))
+        labels.pop(y)
+        return np.random.choice(labels)
 
 
 def get_performance_metrics(
@@ -164,9 +202,9 @@ def get_performance_metrics(
     test_data = (
         data.sample(n=N_SAMPLES, random_state=seed) if N_SAMPLES < len(data) else data
     )
-    for i in test_data.index:
+    for i in tqdm(test_data.index):
         q = test_data.loc[i].to_numpy().flatten()
-        y = 1 - model.predict([q])[0]
+        y = choose_random_label(model.predict([q])[0], model.n_classes_)
         res = explain_one(q, y, explainer, seed=seed, threads=threads, model=model)
         metrics.append(res)
     return metrics, build_time
@@ -218,6 +256,7 @@ def run_experiment(
         "explanations": {},
     }
     for expl_type in MODELS:
+        print(f"\t Explaining with :{expl_type}")
         metrics, build_time = get_performance_metrics(
             model, X, mapper, expl_type, seed, threads
         )
@@ -243,8 +282,8 @@ def save_results(
 
 
 def get_experiment_params(id: int) -> Tuple[str, int, int, int | None]:
-    sd = SEEDS[0]
-    ds = DATASETS[id // (len(N_ESTIMATORS) * len(MAX_DEPTHS))]
+    sd = SEEDS[id // (len(DATASETS) * len(N_ESTIMATORS) * len(MAX_DEPTHS))]
+    ds = DATASETS[id // (len(N_ESTIMATORS) * len(MAX_DEPTHS)) % len(DATASETS)]
     ne = N_ESTIMATORS[(id // len(MAX_DEPTHS)) % len(N_ESTIMATORS)]
     md = MAX_DEPTHS[id % len(MAX_DEPTHS)]
     return ds, ne, md, sd
@@ -300,7 +339,7 @@ def main() -> int:
         "-e",
         type=int,
         default=1,
-        help="Experiment ID (default: 1, between 1 and 90)",
+        help="Experiment ID (default: 1, between 1 and 900)",
     )
     parser.add_argument(
         "--threads",
@@ -319,9 +358,9 @@ def main() -> int:
     )
 
     args = parser.parse_args()
-    if not (1 <= args.experiment <= 90):
+    if not (1 <= args.experiment <= 900):
         raise ValueError(
-            f"Experiment ID must be between 1 and 90, got {args.experiment}"
+            f"Experiment ID must be between 1 and 900, got {args.experiment}"
         )
 
     run_experiments(args.experiment - 1, args.threads, args.model_type)

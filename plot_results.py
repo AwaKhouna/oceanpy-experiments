@@ -4,7 +4,7 @@ import numpy as np
 from parameters import N_ESTIMATORS, MAX_DEPTHS
 from itertools import zip_longest
 
-ADD_BUILD_TIME = False
+ADD_BUILD_TIME = True
 
 
 def load_times(
@@ -21,12 +21,13 @@ def load_times(
     data = []
     for n in N_ESTIMATORS:
         for d in MAX_DEPTHS:
-            filename = f"results/{model_type}/exp_{dataset}_{n}_{d}_2.json"
+            filename = f"results/results/{model_type}/exp_{dataset}_{n}_{d}_2.json"
             try:
                 with open(filename, "r") as f:
                     data += json.load(f)
             except FileNotFoundError:
-                print(f"File not found: {filename}")
+                # print(f"File not found: {filename}")
+                continue
     if n_estimators is not None or max_depth != 0 or seed is not None:
         data = [
             item
@@ -66,12 +67,13 @@ def load_callbacks(
     data = []
     for n in N_ESTIMATORS:
         for d in MAX_DEPTHS:
-            filename = f"results/{model_type}/exp_{dataset}_{n}_{d}_2.json"
+            filename = f"results/results/{model_type}/exp_{dataset}_{n}_{d}_2.json"
             try:
                 with open(filename, "r") as f:
                     data += json.load(f)
             except FileNotFoundError:
-                print(f"File not found: {filename}")
+                # print(f"File not found: {filename}")
+                continue
     if n_estimators is not None or max_depth is not None or seed is not None:
         data = [
             item
@@ -100,7 +102,10 @@ def load_callbacks(
                     if len(cp_cb) > 0
                     else None,
                     "time": cp_e["time"] + cp_build
-                    if len(cp_cb) > 0 and (cp_e["status"] == "OPTIMAL" or cp_e["status"] == "FEASIBLE")
+                    if len(cp_cb) > 0
+                    and (
+                        cp_e["status"] == "OPTIMAL"
+                    )  # or cp_e["status"] == "FEASIBLE")
                     else None,
                 },
             )
@@ -110,19 +115,25 @@ def load_callbacks(
                     if len(mip_cb) > 0
                     else None,
                     "time": mip_e["time"] + mip_build
-                    if len(mip_cb) > 0 and (mip_e["status"] == "OPTIMAL" or mip_e["status"] == "TIME_LIMIT")
+                    if len(mip_cb) > 0
+                    and (
+                        mip_e["status"]
+                        == "OPTIMAL"  # or mip_e["status"] == "TIME_LIMIT"
+                    )
                     else None,
                 }
             )
             cp_callbacks.append(cp_cb)
             mip_callbacks.append(mip_cb)
-            if cp_e["status"] != "OPTIMAL":
-                print(f"\t CP not optimal for instance {item['n_estimators']}")
-            if mip_e["status"] != "OPTIMAL":
-                print(f"\t MIP not optimal for instance {item['n_estimators']}")
+            # if cp_e["status"] != "OPTIMAL":
+            #     print(f"\t CP not optimal for instance {item['n_estimators']}")
+            # if mip_e["status"] != "OPTIMAL":
+            #     print(f"\t MIP not optimal for instance {item['n_estimators']}")
             if mip_e["status"] == "OPTIMAL" and cp_e["status"] == "OPTIMAL":
                 if not np.isclose(
-                    mip_cb[-1]["objective_value"], cp_cb[-1]["objective_value"], atol=1e-2
+                    mip_cb[-1]["objective_value"],
+                    cp_cb[-1]["objective_value"],
+                    atol=1e-2,
                 ):
                     print(
                         f"\tObjective values differ for instance {item['n_estimators']}: "
@@ -187,6 +198,9 @@ def aggregate_callbacks(
 
     cp_interp = np.vstack(cp_rows)  # shape (N, T)
     mip_interp = np.vstack(mip_rows)
+    assert cp_interp.shape == mip_interp.shape
+    assert cp_interp.shape == (len(cp_callbacks), len(common_times))
+    assert len(cp_interp) > 0
 
     def joint_normalize(
         cp_interp: np.ndarray,
@@ -365,7 +379,7 @@ def distance_plot(
     mip_mean_distances,
     mip_std_distances,
     common_times,
-    model_type: str = "rf"
+    model_type: str = "rf",
 ):
     plt.figure(figsize=(6, 4))
     plt.plot(common_times, cp_mean_distances, label="cp")
@@ -406,12 +420,17 @@ def remove_constant_parts(cp_mean_distances, mip_mean_distances):
     return cp_mean_distances, mip_mean_distances
 
 
-def estimators_distance_plot(dataset: str, seed: int | None = None, model_type: str = "rf") -> None:
+def estimators_distance_plot(
+    dataset: str, seed: int | None = None, model_type: str = "rf"
+) -> None:
     __cached__, ax = plt.subplots(figsize=(12, 8))
     colors = plt.cm.viridis(np.linspace(0, 1, len(N_ESTIMATORS)))
     for i, n_estimators in enumerate(N_ESTIMATORS[::-1]):
         cp_callbacks, mip_callbacks = load_callbacks(
-            dataset, n_estimators=n_estimators, seed=seed, model_type=model_type,
+            dataset,
+            n_estimators=n_estimators,
+            seed=seed,
+            model_type=model_type,
         )
         (
             cp_mean_distances,
@@ -452,7 +471,7 @@ def depth_distance_plot(
     dataset: str,
     n_estimators: int | None = None,
     seed: int | None = None,
-    model_type: str = "rf"
+    model_type: str = "rf",
 ) -> None:
     figure, ax = plt.subplots(figsize=(12, 8))
     colors = plt.cm.viridis(np.linspace(0, 1, len(MAX_DEPTHS)))
@@ -504,7 +523,7 @@ def plot_times_vs_anything(
     n_estimators: int | None = None,
     max_depth: int | None = None,
     seed: int | None = None,
-    model_type: str = "rf"
+    model_type: str = "rf",
 ) -> None:
     vs_estimators = n_estimators is None
     if n_estimators is not None:
@@ -576,41 +595,42 @@ def plot_times_vs_anything(
 
 
 def main() -> None:
-    dataset = "Adult"
-    model_type = "rf"
-    cp_times, mip_times = load_times(dataset, model_type=model_type)
-    scatter_plot(dataset, cp_times, mip_times, model_type=model_type)
-    cactus_plot(dataset, cp_times, mip_times, model_type=model_type)
-    times_ratio(dataset, cp_times, mip_times, model_type=model_type)
-    cactus_cdf_plot(dataset, cp_times, mip_times, model_type=model_type)
-    print("First plots done!")
+    # dataset = "Adult"
+    # model_type = "rf"
+    for dataset in ["COMPAS", "Adult", "Credit"]:
+        for model_type in ["rf", "xgb"]:
+            cp_times, mip_times = load_times(dataset, model_type=model_type)
+            scatter_plot(dataset, cp_times, mip_times, model_type=model_type)
+            cactus_plot(dataset, cp_times, mip_times, model_type=model_type)
+            times_ratio(dataset, cp_times, mip_times, model_type=model_type)
+            cactus_cdf_plot(dataset, cp_times, mip_times, model_type=model_type)
+            print("First plots done!")
 
-    times_dict = {"cp": cp_times, "mip": mip_times}
-    tau, profile = compute_performance_profile(times_dict)
-    plot_profile(dataset, tau, profile, model_type=model_type)
+            times_dict = {"cp": cp_times, "mip": mip_times}
+            tau, profile = compute_performance_profile(times_dict)
+            plot_profile(dataset, tau, profile, model_type=model_type)
 
-    cp_callbacks, mip_callbacks = load_callbacks(dataset, model_type=model_type)
-    (
-        cp_mean_distances,
-        cp_std_distances,
-        mip_mean_distances,
-        mip_std_distances,
-        common_times,
-        
-    ) = aggregate_callbacks(cp_callbacks, mip_callbacks)
-    distance_plot(
-        dataset,
-        cp_mean_distances,
-        cp_std_distances,
-        mip_mean_distances,
-        mip_std_distances,
-        common_times,
-        model_type=model_type,
-    )
-    estimators_distance_plot(dataset, seed=2, model_type=model_type)
-    depth_distance_plot(dataset, n_estimators=200, model_type=model_type)
-    plot_times_vs_anything(dataset, n_estimators=200, model_type=model_type)
-    plot_times_vs_anything(dataset, max_depth=9, model_type=model_type)
+            cp_callbacks, mip_callbacks = load_callbacks(dataset, model_type=model_type)
+            (
+                cp_mean_distances,
+                cp_std_distances,
+                mip_mean_distances,
+                mip_std_distances,
+                common_times,
+            ) = aggregate_callbacks(cp_callbacks, mip_callbacks)
+            distance_plot(
+                dataset,
+                cp_mean_distances,
+                cp_std_distances,
+                mip_mean_distances,
+                mip_std_distances,
+                common_times,
+                model_type=model_type,
+            )
+            estimators_distance_plot(dataset, seed=2, model_type=model_type)
+            depth_distance_plot(dataset, n_estimators=200, model_type=model_type)
+            plot_times_vs_anything(dataset, n_estimators=200, model_type=model_type)
+            plot_times_vs_anything(dataset, max_depth=9, model_type=model_type)
 
 
 if __name__ == "__main__":
