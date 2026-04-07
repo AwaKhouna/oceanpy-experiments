@@ -9,7 +9,7 @@ from xgboost import XGBClassifier
 
 def parse_dataset(
     dataset: str,
-    scale: bool = True,
+    scale: bool = False,
     return_mapper: bool = False,
 ) -> pd.DataFrame:
     """

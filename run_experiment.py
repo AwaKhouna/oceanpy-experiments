@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+from itertools import zip_longest
 import sys
 import os
 import json
@@ -23,6 +24,7 @@ from parameters import (
     N_SAMPLES,
 )
 from utils import train_model, get_split_levels, get_node_count, parse_dataset
+from mace_explainer import MACEExplainer
 from ocean import (
     MixedIntegerProgramExplainer,
     ConstraintProgrammingExplainer,
@@ -52,7 +54,7 @@ if ortools.__version__ < "9.11":
 
 def load_dataset(
     dataset: str,
-    scale: bool = True,
+    scale: bool = False,
     return_mapper: bool = True,
 ) -> Tuple[pd.DataFrame, pd.Series]:
     return parse_dataset(
@@ -101,13 +103,19 @@ def check_experiment(
             res["n_estimators"] == n_estimators
             and res["max_depth"] == max_depth
             and res["seed"] == seed
+            and all(method in res.get("explanations", {}) for method in MODELS)
         ):
             return True
     return False
 
 
 def make_explainer(
-    model: BaseExplainableEnsemble, mapper: Any, explainer_type: str
+    model: BaseExplainableEnsemble,
+    mapper: Any,
+    explainer_type: str,
+    data: pd.DataFrame | None = None,
+    target: pd.Series | None = None,
+    dataset_name: str | None = None,
 ) -> Any:
     t0 = time.time()
     if explainer_type == "cp":
@@ -122,6 +130,17 @@ def make_explainer(
     elif explainer_type == "maxsat":
         exp = MaxSATExplainer(model, mapper=mapper)
 
+    elif explainer_type == "mace":
+        if data is None or target is None:
+            raise ValueError("MACEExplainer requires data and target.")
+        exp = MACEExplainer(
+            model,
+            mapper=mapper,
+            data=data,
+            target=target,
+            dataset_name=dataset_name or "dataset",
+        )
+
     else:
         raise ValueError(f"Unknown explainer type: {explainer_type}")
     build_time = time.time() - t0
@@ -131,49 +150,56 @@ def make_explainer(
 def explain_one(
     query: np.ndarray,
     y: int,
-    explainer: MixedIntegerProgramExplainer | ConstraintProgrammingExplainer,
+    explainer: (
+        MixedIntegerProgramExplainer
+        | ConstraintProgrammingExplainer
+        | MaxSATExplainer
+        | MACEExplainer
+    ),
     seed: int,
     threads: int,
     model: Any,
 ) -> Dict[str, Any]:
-    is_maxsat_explainer: bool = explainer.Type == MaxSATExplainer.Type
+    is_maxsat_explainer = getattr(explainer, "Type", None) == MaxSATExplainer.Type
     t0 = time.time()
-    if is_maxsat_explainer:
-        cf = explainer.explain(
-            query,
-            y=y,
-            norm=1,
-            max_time=TIMEOUT,
-            random_seed=seed,
-            verbose=False,
-        )
-    else:
-        cf = explainer.explain(
-            query,
-            y=y,
-            norm=1,
-            return_callback=True,
-            max_time=TIMEOUT,
-            random_seed=seed,
-            num_workers=threads,
-            verbose=False,
-        )
+    cf = explainer.explain(
+        query,
+        y=y,
+        norm=1,
+        return_callback=True,
+        max_time=TIMEOUT,
+        random_seed=seed,
+        num_workers=threads if not is_maxsat_explainer else None,
+        verbose=False,
+    )
     explainer.cleanup()
     t_final = time.time() - t0
-    if is_maxsat_explainer:
+    callback = getattr(explainer, "callback", None)
+    if callback is not None:
+        sollist = callback.sollist
+    elif is_maxsat_explainer:
         sollist = (
             []
             if cf is None
-            else [{"objective": explainer.get_objective_value(), "time": t_final}]
+            else [{"objective_value": explainer.get_distance(), "time": t_final}]
         )
     else:
-        sollist = explainer.callback.sollist
+        sollist = []
+    if cf is None:
+        return {
+            "cf": None,
+            "objective": None,
+            "status": explainer.get_solving_status(),
+            "valid": None,
+            "target": int(y),
+            "time": t_final,
+            "callback": sollist,
+        }
     return {
-        "objective": explainer.get_objective_value() if cf is not None else None,
+        "cf": cf.to_numpy().tolist(),
+        "objective": explainer.get_distance(),
         "status": explainer.get_solving_status(),
-        "valid": int(y) == int(model.predict([cf.to_numpy()])[0])
-        if cf is not None
-        else None,
+        "valid": int(y) == int(model.predict([cf.to_numpy()])[0]),
         "target": int(y),
         "time": t_final,
         "callback": sollist,
@@ -192,12 +218,21 @@ def choose_random_label(y: int, n_classes: int) -> int:
 def get_performance_metrics(
     model: Any,
     data: pd.DataFrame,
+    target: pd.Series,
     mapper: Any,
     explainer_type: str,
     seed: int,
     threads: int,
+    dataset_name: str,
 ) -> List[Dict[str, Any]]:
-    explainer, build_time = make_explainer(model, mapper, explainer_type)
+    explainer, build_time = make_explainer(
+        model,
+        mapper,
+        explainer_type,
+        data=data,
+        target=target,
+        dataset_name=dataset_name,
+    )
     metrics: List[Dict[str, Any]] = []
     test_data = (
         data.sample(n=N_SAMPLES, random_state=seed) if N_SAMPLES < len(data) else data
@@ -208,6 +243,15 @@ def get_performance_metrics(
         res = explain_one(q, y, explainer, seed=seed, threads=threads, model=model)
         metrics.append(res)
     return metrics, build_time
+
+
+def make_mace_placeholder(reason: str) -> Dict[str, Any]:
+    return {
+        "build_time": 0.0,
+        "metrics": [],
+        "supported": False,
+        "reason": reason,
+    }
 
 
 def run_experiment(
@@ -256,17 +300,52 @@ def run_experiment(
         "n_features": X.shape[1],
         "explanations": {},
     }
-    for expl_type in MODELS:
+    for j, expl_type in enumerate(MODELS):
         print(f"\t Explaining with :{expl_type}")
-        metrics, build_time = get_performance_metrics(
-            model, X, mapper, expl_type, seed, threads
-        )
-        out["explanations"][expl_type] = {
-            "build_time": build_time,
-            "metrics": metrics,
-        }
+        if expl_type == "mace" and model_type != "rf":
+            out["explanations"][expl_type] = make_mace_placeholder(
+                "MACE integration is only enabled for rf experiments."
+            )
+        else:
+            try:
+                metrics, build_time = get_performance_metrics(
+                    model,
+                    X,
+                    y,
+                    mapper,
+                    expl_type,
+                    seed,
+                    threads,
+                    dataset_path,
+                )
+                out["explanations"][expl_type] = {
+                    "build_time": build_time,
+                    "metrics": metrics,
+                }
+                if expl_type == "mace":
+                    out["explanations"][expl_type]["supported"] = True
+            except ValueError as exc:
+                if expl_type != "mace":
+                    raise
+                out["explanations"][expl_type] = make_mace_placeholder(str(exc))
+        if j >= 1:
+            check_results(out)
         save_results(out, filename=filename, overwrite=True)
     return out
+
+
+def check_results(results: Dict[str, Any]) -> None:
+    cp_metrics = results["explanations"]["cp"]["metrics"]
+    mip_metrics = results["explanations"]["mip"]["metrics"]
+    for cp, mip in zip_longest(cp_metrics, mip_metrics):
+        mip_optimal = mip is not None and mip["status"] == "OPTIMAL"
+        cp_optimal = cp is not None and cp["status"] == "OPTIMAL"
+        if not mip_optimal or not cp_optimal:
+            continue
+        if cp["objective"] is not None and mip["objective"] is not None:
+            assert abs(cp["objective"] - mip["objective"]) < 1e-4, (
+                f"Objective values differ: {cp['objective']:.4f} vs {mip['objective']:.4f} cf_mip={mip['cf']} cf_cp={cp['cf']}"
+            )
 
 
 def save_results(
@@ -293,7 +372,11 @@ def get_experiment_params(id: int) -> Tuple[str, int, int, int | None]:
 
 
 def run_experiments(
-    experiment_id: int = 1, threads: int = 1, model_type: Literal["rf", "xgb"] = "rf"
+    experiment_id: int = 1,
+    threads: int = 1,
+    model_type: Literal["rf", "xgb"] = "rf",
+    force: bool = False,
+    overwrite: bool = False,
 ) -> None:
     if threads > os.cpu_count():
         raise ValueError(
@@ -313,14 +396,27 @@ def run_experiments(
     )
 
     ds, ne, md, sd = get_experiment_params(experiment_id)
-    if check_experiment(ds, ne, md, sd, model_type=model_type):
+    filename = f"{model_type}/exp_{ds}_{ne}_{md}_{sd}.json"
+    results_path = Path(f"results/{filename}")
+
+    if not force and not overwrite and check_experiment(ds, ne, md, sd, model_type=model_type):
         logger.info("Experiment %d already completed", experiment_id)
+        print(
+            f"Experiment {experiment_id + 1} already completed for {ds} "
+            f"(n_estimators={ne}, max_depth={md}, seed={sd}). "
+            "Use --force to rerun or --overwrite to replace the saved file."
+        )
         return
+
+    if overwrite and results_path.exists():
+        results_path.unlink()
+        logger.info("Deleted existing results file %s", results_path)
+        print(f"Overwriting existing results file {results_path}")
+
     print(
         f"Running experiment {experiment_id} with dataset {ds},",
         f" n_estimators={ne}, max_depth={md}, seed={sd}, threads={threads}",
     )
-    filename = f"{model_type}/exp_{ds}_{ne}_{md}_{sd}.json"
     res = run_experiment(
         dataset_path=ds,
         n_estimators=ne,
@@ -330,10 +426,20 @@ def run_experiments(
         model_type=model_type,
         filename=filename,
     )
-    save_results(res, filename=filename)
 
     # Path("results.json").write_text(json.dumps(all_results, indent=2))
     logger.info(f"Experiment {experiment_id} is done — wrote results to {filename}")
+
+
+def print_rf_splits_levels(model: BaseExplainableEnsemble) -> None:
+    splits = [set() for _ in range(model.n_features_in_)]
+    for i, est in enumerate(model.estimators_):
+        tree = est.tree_
+        for j in range(tree.node_count):
+            if tree.children_left[j] != -1:  # not a leaf
+                splits[tree.feature[j]].add(tree.threshold[j])
+    for i, s in enumerate(splits):
+        print(f"Feature {i} has {len(s)} unique split levels: {sorted(s)}")
 
 
 def main() -> int:
@@ -360,6 +466,16 @@ def main() -> int:
         default="rf",
         help="Model type (default: rf)",
     )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Rerun the experiment even if a completed result file already exists.",
+    )
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Delete the existing results file for this experiment before rerunning.",
+    )
 
     args = parser.parse_args()
     if not (1 <= args.experiment <= 900):
@@ -367,7 +483,13 @@ def main() -> int:
             f"Experiment ID must be between 1 and 900, got {args.experiment}"
         )
 
-    run_experiments(args.experiment - 1, args.threads, args.model_type)
+    run_experiments(
+        args.experiment - 1,
+        args.threads,
+        args.model_type,
+        args.force,
+        args.overwrite,
+    )
     return 0
 
 

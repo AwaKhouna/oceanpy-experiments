@@ -8,3 +8,5 @@ ucimlrepo
 setuptools
 xgboost
 tqdm
+pysmt
+z3-solver

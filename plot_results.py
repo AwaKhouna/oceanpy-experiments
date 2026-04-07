@@ -1,10 +1,11 @@
 import json
 import matplotlib.pyplot as plt
 import numpy as np
-from parameters import N_ESTIMATORS, MAX_DEPTHS
+from parameters import N_ESTIMATORS, MAX_DEPTHS, DATASETS
 from itertools import zip_longest
 
 ADD_BUILD_TIME = True
+RESULTS_DIR = "results/"
 
 
 def load_times(
@@ -21,7 +22,7 @@ def load_times(
     data = []
     for n in N_ESTIMATORS:
         for d in MAX_DEPTHS:
-            filename = f"results/results/{model_type}/exp_{dataset}_{n}_{d}_2.json"
+            filename = f"{RESULTS_DIR}{model_type}/exp_{dataset}_{n}_{d}_2.json"
             try:
                 with open(filename, "r") as f:
                     data += json.load(f)
@@ -67,7 +68,7 @@ def load_callbacks(
     data = []
     for n in N_ESTIMATORS:
         for d in MAX_DEPTHS:
-            filename = f"results/results/{model_type}/exp_{dataset}_{n}_{d}_2.json"
+            filename = f"{RESULTS_DIR}{model_type}/exp_{dataset}_{n}_{d}_2.json"
             try:
                 with open(filename, "r") as f:
                     data += json.load(f)
@@ -597,7 +598,7 @@ def plot_times_vs_anything(
 def main() -> None:
     # dataset = "Adult"
     # model_type = "rf"
-    for dataset in ["COMPAS", "Adult", "Credit"]:
+    for dataset in DATASETS:
         for model_type in ["rf", "xgb"]:
             cp_times, mip_times = load_times(dataset, model_type=model_type)
             scatter_plot(dataset, cp_times, mip_times, model_type=model_type)
