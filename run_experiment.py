@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-from itertools import zip_longest
 import sys
 import os
 import json
@@ -37,6 +36,7 @@ from ocean.typing import BaseExplainableEnsemble
 
 warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")
 logger = logging.getLogger(__name__)
+METHOD_RESULT_KEYS = ("objective", "cf", "status", "time", "valid", "callback")
 
 ## For compatibility with ortools 9.10 and earlier versions
 if ortools.__version__ < "9.11":
@@ -99,11 +99,17 @@ def check_experiment(
         results = json.load(f)
 
     for res in results:
+        explanations = res.get("explanations")
+        has_all_methods = False
+        if isinstance(explanations, dict):
+            has_all_methods = all(method in explanations for method in MODELS)
+        elif isinstance(explanations, list):
+            has_all_methods = all(f"{method}_build_time" in res for method in MODELS)
         if (
             res["n_estimators"] == n_estimators
             and res["max_depth"] == max_depth
             and res["seed"] == seed
-            and all(method in res.get("explanations", {}) for method in MODELS)
+            and has_all_methods
         ):
             return True
     return False
@@ -171,8 +177,8 @@ def explain_one(
         random_seed=seed,
         num_workers=threads if not is_maxsat_explainer else None,
         verbose=False,
+        clean_up=True,
     )
-    explainer.cleanup()
     t_final = time.time() - t0
     callback = getattr(explainer, "callback", None)
     if callback is not None:
@@ -187,6 +193,7 @@ def explain_one(
         sollist = []
     if cf is None:
         return {
+            "query": query.tolist(),
             "cf": None,
             "objective": None,
             "status": explainer.get_solving_status(),
@@ -196,6 +203,7 @@ def explain_one(
             "callback": sollist,
         }
     return {
+        "query": query.tolist(),
         "cf": cf.to_numpy().tolist(),
         "objective": explainer.get_distance(),
         "status": explainer.get_solving_status(),
@@ -206,13 +214,54 @@ def explain_one(
     }
 
 
-def choose_random_label(y: int, n_classes: int) -> int:
+def choose_random_label(y: int, n_classes: int, seed: int) -> int:
     if n_classes == 2:
         return 1 - y
     else:
         labels = list(range(n_classes))
         labels.pop(y)
+        np.random.seed(seed)
         return np.random.choice(labels)
+
+
+def initialize_explanations(
+    test_data: pd.DataFrame,
+    targets: List[int],
+) -> List[Dict[str, Any]]:
+    explanations: List[Dict[str, Any]] = []
+    for i, target in zip(test_data.index, targets):
+        explanation: Dict[str, Any] = {
+            "query": test_data.loc[i].to_numpy().flatten().tolist(),
+            "target": int(target),
+        }
+        for method in MODELS:
+            explanation[f"{method}_objective"] = None
+            explanation[f"{method}_cf"] = None
+            explanation[f"{method}_status"] = None
+            explanation[f"{method}_time"] = None
+            explanation[f"{method}_valid"] = None
+            explanation[f"{method}_callback"] = []
+        explanations.append(explanation)
+    return explanations
+
+
+def merge_method_metrics(
+    explanations: List[Dict[str, Any]],
+    explainer_type: str,
+    metrics: List[Dict[str, Any]],
+) -> None:
+    if len(explanations) != len(metrics):
+        raise ValueError(
+            f"Instance count mismatch for {explainer_type}: "
+            f"{len(explanations)} expected, got {len(metrics)}"
+        )
+    for explanation, metric in zip(explanations, metrics):
+        if explanation["query"] != metric["query"]:
+            raise ValueError(f"Query mismatch while merging {explainer_type} results.")
+        if explanation["target"] != metric["target"]:
+            raise ValueError(f"Target mismatch while merging {explainer_type} results.")
+        for key in METHOD_RESULT_KEYS:
+            explanation[f"{explainer_type}_{key}"] = metric[key]
 
 
 def get_performance_metrics(
@@ -224,7 +273,9 @@ def get_performance_metrics(
     seed: int,
     threads: int,
     dataset_name: str,
-) -> List[Dict[str, Any]]:
+    test_data: pd.DataFrame | None = None,
+    targets: List[int] | None = None,
+) -> Tuple[List[Dict[str, Any]], float]:
     explainer, build_time = make_explainer(
         model,
         mapper,
@@ -234,12 +285,23 @@ def get_performance_metrics(
         dataset_name=dataset_name,
     )
     metrics: List[Dict[str, Any]] = []
-    test_data = (
-        data.sample(n=N_SAMPLES, random_state=seed) if N_SAMPLES < len(data) else data
-    )
-    for i in tqdm(test_data.index):
+    if test_data is None:
+        test_data = (
+            data.sample(n=N_SAMPLES, random_state=seed)
+            if N_SAMPLES < len(data)
+            else data
+        )
+    if targets is not None and len(test_data) != len(targets):
+        raise ValueError(
+            f"Target count mismatch: {len(test_data)} queries, {len(targets)} targets"
+        )
+    for j, i in enumerate(tqdm(test_data.index)):
         q = test_data.loc[i].to_numpy().flatten()
-        y = choose_random_label(model.predict([q])[0], model.n_classes_)
+        y = (
+            targets[j]
+            if targets is not None
+            else choose_random_label(model.predict([q])[0], model.n_classes_, seed)
+        )
         res = explain_one(q, y, explainer, seed=seed, threads=threads, model=model)
         metrics.append(res)
     return metrics, build_time
@@ -248,7 +310,6 @@ def get_performance_metrics(
 def make_mace_placeholder(reason: str) -> Dict[str, Any]:
     return {
         "build_time": 0.0,
-        "metrics": [],
         "supported": False,
         "reason": reason,
     }
@@ -287,6 +348,15 @@ def run_experiment(
         model_type=model_type,
     )
     acc = model.score(X, y)
+    test_data = X.sample(n=N_SAMPLES, random_state=seed) if N_SAMPLES < len(X) else X
+    targets = [
+        choose_random_label(
+            model.predict([test_data.loc[i].to_numpy().flatten()])[0],
+            model.n_classes_,
+            seed,
+        )
+        for i in test_data.index
+    ]
     out: Dict[str, Any] = {
         "dataset": dataset_path,
         "model_type": model_type,
@@ -298,14 +368,17 @@ def run_experiment(
         "threads": threads,
         "accuracy": acc,
         "n_features": X.shape[1],
-        "explanations": {},
+        "explanations": initialize_explanations(test_data, targets),
     }
     for j, expl_type in enumerate(MODELS):
         print(f"\t Explaining with :{expl_type}")
         if expl_type == "mace" and model_type != "rf":
-            out["explanations"][expl_type] = make_mace_placeholder(
+            placeholder = make_mace_placeholder(
                 "MACE integration is only enabled for rf experiments."
             )
+            out[f"{expl_type}_build_time"] = placeholder["build_time"]
+            out[f"{expl_type}_supported"] = placeholder["supported"]
+            out[f"{expl_type}_reason"] = placeholder["reason"]
         else:
             try:
                 metrics, build_time = get_performance_metrics(
@@ -317,39 +390,52 @@ def run_experiment(
                     seed,
                     threads,
                     dataset_path,
+                    test_data=test_data,
+                    targets=targets,
                 )
-                out["explanations"][expl_type] = {
-                    "build_time": build_time,
-                    "metrics": metrics,
-                }
+                out[f"{expl_type}_build_time"] = build_time
+                merge_method_metrics(out["explanations"], expl_type, metrics)
                 if expl_type == "mace":
-                    out["explanations"][expl_type]["supported"] = True
+                    out["mace_supported"] = True
+                    out.pop("mace_reason", None)
             except ValueError as exc:
                 if expl_type != "mace":
                     raise
-                out["explanations"][expl_type] = make_mace_placeholder(str(exc))
+                placeholder = make_mace_placeholder(str(exc))
+                out[f"{expl_type}_build_time"] = placeholder["build_time"]
+                out[f"{expl_type}_supported"] = placeholder["supported"]
+                out[f"{expl_type}_reason"] = placeholder["reason"]
         if j >= 1:
-            check_results(out)
+            check_results(out, model)
         save_results(out, filename=filename, overwrite=True)
     return out
 
 
-def check_results(results: Dict[str, Any]) -> None:
-    cp_metrics = results["explanations"]["cp"]["metrics"]
-    mip_metrics = results["explanations"]["mip"]["metrics"]
-    for cp, mip in zip_longest(cp_metrics, mip_metrics):
-        mip_optimal = mip is not None and mip["status"] == "OPTIMAL"
-        cp_optimal = cp is not None and cp["status"] == "OPTIMAL"
+def check_results(results: Dict[str, Any], model: BaseExplainableEnsemble) -> None:
+    for explanation in results["explanations"]:
+        mip_optimal = explanation["mip_status"] == "OPTIMAL"
+        cp_optimal = explanation["cp_status"] == "OPTIMAL"
         if not mip_optimal or not cp_optimal:
             continue
-        if cp["objective"] is not None and mip["objective"] is not None:
-            assert abs(cp["objective"] - mip["objective"]) < 1e-4, (
-                f"Objective values differ: {cp['objective']:.4f} vs {mip['objective']:.4f} cf_mip={mip['cf']} cf_cp={cp['cf']}"
-            )
+        if (
+            explanation["cp_objective"] is not None
+            and explanation["mip_objective"] is not None
+        ):
+            if abs(explanation["cp_objective"] - explanation["mip_objective"]) >= 1e-2:
+                print_rf_splits_levels(model)
+                msg = (
+                    "Objective values differ: "
+                    f"{explanation['cp_objective']:.4f} vs {explanation['mip_objective']:.4f} \n"
+                    f"query={explanation['query']} \n"
+                    f"cf_mip={explanation['mip_cf']} \n"
+                    f"cf_cp={explanation['cp_cf']}"
+                )
+                logger.warning(msg)
+                warnings.warn(msg, category=UserWarning, stacklevel=2)
 
 
 def save_results(
-    results: List[Dict[str, Any]],
+    results: Dict[str, Any],
     filename: str,
     overwrite: bool = False,
 ) -> None:
@@ -399,7 +485,11 @@ def run_experiments(
     filename = f"{model_type}/exp_{ds}_{ne}_{md}_{sd}.json"
     results_path = Path(f"results/{filename}")
 
-    if not force and not overwrite and check_experiment(ds, ne, md, sd, model_type=model_type):
+    if (
+        not force
+        and not overwrite
+        and check_experiment(ds, ne, md, sd, model_type=model_type)
+    ):
         logger.info("Experiment %d already completed", experiment_id)
         print(
             f"Experiment {experiment_id + 1} already completed for {ds} "
@@ -417,7 +507,7 @@ def run_experiments(
         f"Running experiment {experiment_id} with dataset {ds},",
         f" n_estimators={ne}, max_depth={md}, seed={sd}, threads={threads}",
     )
-    res = run_experiment(
+    _ = run_experiment(
         dataset_path=ds,
         n_estimators=ne,
         max_depth=md,

@@ -8,6 +8,32 @@ ADD_BUILD_TIME = True
 RESULTS_DIR = "results/"
 
 
+def get_method_metrics(
+    item: dict,
+    method: str,
+) -> tuple[list[dict], float]:
+    explanations = item["explanations"]
+    if isinstance(explanations, dict):
+        method_data = explanations[method]
+        return method_data["metrics"], method_data["build_time"]
+
+    build_time = item.get(f"{method}_build_time", 0.0)
+    metrics = []
+    for explanation in explanations:
+        metrics.append(
+            {
+                "cf": explanation.get(f"{method}_cf"),
+                "objective": explanation.get(f"{method}_objective"),
+                "status": explanation.get(f"{method}_status"),
+                "time": explanation.get(f"{method}_time"),
+                "valid": explanation.get(f"{method}_valid"),
+                "target": explanation.get("target"),
+                "callback": list(explanation.get(f"{method}_callback") or []),
+            }
+        )
+    return metrics, build_time
+
+
 def load_times(
     dataset: str,
     n_estimators: int | None = None,
@@ -40,10 +66,10 @@ def load_times(
     cp_times = []
     mip_times = []
     for item in data:
-        cp_list = item["explanations"]["cp"]["metrics"]
-        mip_list = item["explanations"]["mip"]["metrics"]
-        cp_build = item["explanations"]["cp"]["build_time"] * ADD_BUILD_TIME
-        mip_build = item["explanations"]["mip"]["build_time"] * ADD_BUILD_TIME
+        cp_list, cp_build = get_method_metrics(item, "cp")
+        mip_list, mip_build = get_method_metrics(item, "mip")
+        cp_build *= ADD_BUILD_TIME
+        mip_build *= ADD_BUILD_TIME
         if len(cp_list) != len(mip_list):
             raise ValueError(
                 f"Instance count mismatch: cp has {len(cp_list)}, mip has {len(mip_list)}"
@@ -86,10 +112,10 @@ def load_callbacks(
     cp_callbacks = []
     mip_callbacks = []
     for item in data:
-        cp_list = item["explanations"]["cp"]["metrics"]
-        mip_list = item["explanations"]["mip"]["metrics"]
-        cp_build = item["explanations"]["cp"]["build_time"] * ADD_BUILD_TIME
-        mip_build = item["explanations"]["mip"]["build_time"] * ADD_BUILD_TIME
+        cp_list, cp_build = get_method_metrics(item, "cp")
+        mip_list, mip_build = get_method_metrics(item, "mip")
+        cp_build *= ADD_BUILD_TIME
+        mip_build *= ADD_BUILD_TIME
         if len(cp_list) != len(mip_list):
             raise ValueError(
                 f"Instance count mismatch: cp has {len(cp_list)}, mip has {len(mip_list)}"
