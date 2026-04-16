@@ -1,663 +1,1440 @@
-import json
-import matplotlib.pyplot as plt
-import numpy as np
-from parameters import N_ESTIMATORS, MAX_DEPTHS, DATASETS
-from itertools import zip_longest
+#!/usr/bin/env python3
+from __future__ import annotations
 
-ADD_BUILD_TIME = True
-RESULTS_DIR = "results/"
+import json
+import os
+import warnings
+from dataclasses import dataclass
+from functools import lru_cache
+from itertools import combinations
+from pathlib import Path
+from tempfile import gettempdir
+from typing import Any
+
+import numpy as np
+
+from parameters import DATASETS, MAX_DEPTHS, MODELS, N_ESTIMATORS, TIMEOUT, VOTING
+
+
+_CACHE_DIR = Path(gettempdir()) / "oceanpy-plot-cache"
+_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+(_CACHE_DIR / "matplotlib").mkdir(parents=True, exist_ok=True)
+(_CACHE_DIR / "xdg-cache").mkdir(parents=True, exist_ok=True)
+os.environ.setdefault("MPLCONFIGDIR", str(_CACHE_DIR / "matplotlib"))
+os.environ.setdefault("XDG_CACHE_HOME", str(_CACHE_DIR / "xdg-cache"))
+
+
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+
+EPSILON = 1e-12
+RESULTS_DIR = Path("results")
+PLOTS_DIR = Path("plots")
+UNSET = object()
+
+METHOD_COLORS = {
+    "cp": "#1f77b4",
+    "mip": "#ff7f0e",
+    "maxsat": "#2ca02c",
+    "mace": "#d62728",
+}
+METHOD_LINESTYLES = {
+    "cp": "-",
+    "mip": "--",
+    "maxsat": "-.",
+    "mace": ":",
+}
+METHOD_LABELS = {
+    "cp": "CP",
+    "mip": "MIP",
+    "maxsat": "MaxSAT",
+    "mace": "MACE",
+}
+PARAMETER_LABELS = {
+    "n_estimators": "Number of trees",
+    "max_depth": "Max depth",
+}
+
+
+@dataclass(frozen=True)
+class ResultBundle:
+    times: dict[str, np.ndarray]
+    statuses: dict[str, np.ndarray]
+    has_cfs: dict[str, np.ndarray]
+    callbacks: dict[str, list[list[tuple[float, float]]]]
+    total_instances: int
+
+    @property
+    def active_time_methods(self) -> list[str]:
+        return [method for method in MODELS if has_valid_times(self, method)]
+
+    @property
+    def active_callback_methods(self) -> list[str]:
+        return [method for method in MODELS if any(self.callbacks.get(method, []))]
+
+
+def method_label(method: str) -> str:
+    return METHOD_LABELS.get(method, method)
+
+
+def format_parameter_value(value: Any) -> str:
+    return "None" if value is None else str(value)
+
+
+def time_mode_label(include_build_time: bool) -> str:
+    return "with build time" if include_build_time else "solver time only"
+
+
+def has_finite_values(values: np.ndarray | None) -> bool:
+    return values is not None and values.size > 0 and np.isfinite(values).any()
+
+
+def is_optimal_status(status: Any) -> bool:
+    return status == "OPTIMAL"
+
+
+def has_valid_times(bundle: ResultBundle, method: str) -> bool:
+    values = bundle.times.get(method)
+    has_cfs = bundle.has_cfs.get(method)
+    if values is None or has_cfs is None or values.size == 0:
+        return False
+    return np.isfinite(values[has_cfs]).any()
+
+
+def normalize_voting(model_type: str, voting: str | None = None) -> str:
+    if model_type == "xgb":
+        return "SOFT"
+    return (voting or "SOFT").upper()
+
+
+def result_identity(item: dict[str, Any]) -> tuple[Any, ...]:
+    return (
+        item.get("dataset"),
+        item.get("model_type"),
+        item.get("n_estimators"),
+        item.get("max_depth"),
+        item.get("seed"),
+        item.get("voting", "SOFT"),
+    )
+
+
+def result_methods(item: dict[str, Any]) -> list[str]:
+    return [method for method in MODELS if f"{method}_build_time" in item]
+
+
+def merge_result_entry(
+    existing: dict[str, Any],
+    incoming: dict[str, Any],
+    methods_to_merge: list[str],
+) -> dict[str, Any]:
+    merged = dict(existing)
+    for field in (
+        "dataset",
+        "model_type",
+        "n_estimators",
+        "max_depth",
+        "split_levels",
+        "nodes",
+        "seed",
+        "threads",
+        "accuracy",
+        "n_features",
+        "voting",
+    ):
+        if field in incoming:
+            merged[field] = incoming[field]
+
+    existing_explanations = merged.get("explanations")
+    incoming_explanations = incoming.get("explanations")
+    if not isinstance(existing_explanations, list) or not isinstance(
+        incoming_explanations, list
+    ):
+        return merged
+
+    if len(existing_explanations) != len(incoming_explanations):
+        return incoming
+
+    for existing_explanation, incoming_explanation in zip(
+        existing_explanations, incoming_explanations
+    ):
+        if existing_explanation.get("query") != incoming_explanation.get("query"):
+            return incoming
+        if existing_explanation.get("target") != incoming_explanation.get("target"):
+            return incoming
+        for method in methods_to_merge:
+            for key in ("objective", "cf", "status", "time", "valid", "callback"):
+                metric_key = f"{method}_{key}"
+                existing_explanation[metric_key] = incoming_explanation.get(metric_key)
+
+    for method in methods_to_merge:
+        for suffix in ("build_time", "supported", "reason"):
+            field = f"{method}_{suffix}"
+            if field in incoming:
+                merged[field] = incoming[field]
+            elif suffix != "build_time":
+                merged.pop(field, None)
+    return merged
+
+
+def coalesce_results(items: list[dict[str, Any]]) -> tuple[dict[str, Any], ...]:
+    merged: dict[tuple[Any, ...], dict[str, Any]] = {}
+    order: list[tuple[Any, ...]] = []
+    for item in items:
+        key = result_identity(item)
+        if key not in merged:
+            merged[key] = item
+            order.append(key)
+            continue
+        merged[key] = merge_result_entry(merged[key], item, result_methods(item))
+    return tuple(merged[key] for key in order)
+
+
+def ensure_output_dir(dataset: str, model_type: str, voting: str | None = None) -> Path:
+    output_dir = PLOTS_DIR / model_type
+    if model_type == "rf":
+        output_dir = output_dir / normalize_voting(model_type, voting).lower()
+    output_dir = output_dir / dataset
+    output_dir.mkdir(parents=True, exist_ok=True)
+    return output_dir
+
+
+def to_finite_float(value: Any) -> float | None:
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not np.isfinite(result):
+        return None
+    return result
+
+
+def build_time_or_zero(value: Any) -> float:
+    build_time = to_finite_float(value)
+    if build_time is None or build_time < 0:
+        return 0.0
+    return build_time
+
+
+def cap_runtime_for_plot(value: float) -> float:
+    return min(value, float(TIMEOUT))
+
+
+def normalize_elapsed_time(
+    value: Any,
+    build_time: float,
+    *,
+    include_build_time: bool,
+) -> float:
+    runtime = to_finite_float(value)
+    if runtime is None or runtime < 0:
+        return np.nan
+    total = runtime + (build_time if include_build_time else 0.0)
+    return max(cap_runtime_for_plot(total), EPSILON)
+
+
+def filter_items(
+    items: tuple[dict[str, Any], ...],
+    *,
+    n_estimators: Any = UNSET,
+    max_depth: Any = UNSET,
+    seed: Any = UNSET,
+    voting: Any = UNSET,
+) -> list[dict[str, Any]]:
+    filtered: list[dict[str, Any]] = []
+    for item in items:
+        if n_estimators is not UNSET and item.get("n_estimators") != n_estimators:
+            continue
+        if max_depth is not UNSET and item.get("max_depth") != max_depth:
+            continue
+        if seed is not UNSET and item.get("seed") != seed:
+            continue
+        if voting is not UNSET and item.get("voting", "SOFT") != voting:
+            continue
+        filtered.append(item)
+    return filtered
+
+
+def select_reference_value(
+    dataset: str,
+    model_type: str,
+    *,
+    fixed_parameter_name: str,
+    preferred_value: Any,
+    varying_parameter_name: str,
+    varying_values: list[Any],
+    seed: Any = UNSET,
+    voting: Any = UNSET,
+) -> Any:
+    candidates = N_ESTIMATORS if fixed_parameter_name == "n_estimators" else MAX_DEPTHS
+    items = load_dataset_results(dataset, model_type)
+    coverage: dict[Any, int] = {}
+
+    for candidate in candidates:
+        filters = {
+            "n_estimators": UNSET,
+            "max_depth": UNSET,
+            "seed": seed,
+            "voting": voting,
+        }
+        filters[fixed_parameter_name] = candidate
+        filtered_items = filter_items(items, **filters)
+        distinct_values = {
+            item.get(varying_parameter_name)
+            for item in filtered_items
+            if item.get(varying_parameter_name) in varying_values
+        }
+        coverage[candidate] = len(distinct_values)
+
+    if coverage.get(preferred_value, 0) > 0:
+        return preferred_value
+
+    ranked_candidates = sorted(
+        candidates,
+        key=lambda candidate: (
+            coverage.get(candidate, 0),
+            -candidates.index(candidate),
+        ),
+        reverse=True,
+    )
+    best_candidate = ranked_candidates[0]
+    return best_candidate if coverage.get(best_candidate, 0) > 0 else preferred_value
+
+
+@lru_cache(maxsize=None)
+def load_dataset_results(dataset: str, model_type: str) -> tuple[dict[str, Any], ...]:
+    model_dir = RESULTS_DIR / model_type
+    if not model_dir.exists():
+        return tuple()
+
+    items: list[dict[str, Any]] = []
+    for path in sorted(model_dir.glob(f"exp_{dataset}_*.json")):
+        try:
+            with path.open("r") as handle:
+                payload = json.load(handle)
+        except (OSError, json.JSONDecodeError) as exc:
+            print(f"Skipping unreadable results file {path}: {exc}")
+            continue
+
+        if not isinstance(payload, list):
+            print(f"Skipping unexpected payload in {path}: expected a list.")
+            continue
+
+        for item in payload:
+            if isinstance(item, dict):
+                items.append(item)
+
+    return coalesce_results(items)
 
 
 def get_method_metrics(
-    item: dict,
-    method: str,
-) -> tuple[list[dict], float]:
-    explanations = item["explanations"]
-    if isinstance(explanations, dict):
-        method_data = explanations[method]
-        return method_data["metrics"], method_data["build_time"]
+    item: dict[str, Any], method: str
+) -> tuple[list[dict[str, Any]], float]:
+    explanations = item.get("explanations") or []
 
-    build_time = item.get(f"{method}_build_time", 0.0)
-    metrics = []
+    if isinstance(explanations, dict):
+        method_data = explanations.get(method) or {}
+        metrics = method_data.get("metrics") or []
+        return list(metrics), build_time_or_zero(method_data.get("build_time"))
+
+    if not isinstance(explanations, list):
+        return [], build_time_or_zero(item.get(f"{method}_build_time"))
+
+    metrics: list[dict[str, Any]] = []
     for explanation in explanations:
+        data = explanation if isinstance(explanation, dict) else {}
+        raw_callback = data.get(f"{method}_callback") or []
+        callback = raw_callback if isinstance(raw_callback, list) else []
         metrics.append(
             {
-                "cf": explanation.get(f"{method}_cf"),
-                "objective": explanation.get(f"{method}_objective"),
-                "status": explanation.get(f"{method}_status"),
-                "time": explanation.get(f"{method}_time"),
-                "valid": explanation.get(f"{method}_valid"),
-                "target": explanation.get("target"),
-                "callback": list(explanation.get(f"{method}_callback") or []),
+                "cf": data.get(f"{method}_cf"),
+                "objective": data.get(f"{method}_objective"),
+                "status": data.get(f"{method}_status"),
+                "time": data.get(f"{method}_time"),
+                "valid": data.get(f"{method}_valid"),
+                "target": data.get("target"),
+                "callback": [entry for entry in callback if isinstance(entry, dict)],
             }
         )
-    return metrics, build_time
+
+    return metrics, build_time_or_zero(item.get(f"{method}_build_time"))
 
 
-def load_times(
+def normalize_callback_series(
+    metric: dict[str, Any],
+    build_time: float,
+    *,
+    include_build_time: bool,
+) -> list[tuple[float, float]]:
+    offset = build_time if include_build_time else 0.0
+    points: list[tuple[float, float]] = []
+
+    for entry in metric.get("callback") or []:
+        time_value = to_finite_float(entry.get("time"))
+        objective_value = to_finite_float(entry.get("objective_value"))
+        if time_value is None or objective_value is None or time_value < 0:
+            continue
+        points.append(
+            (max(cap_runtime_for_plot(time_value + offset), EPSILON), objective_value)
+        )
+
+    final_time = normalize_elapsed_time(
+        metric.get("time"),
+        build_time,
+        include_build_time=include_build_time,
+    )
+    final_objective = to_finite_float(metric.get("objective"))
+    if np.isfinite(final_time) and final_objective is not None:
+        points.append((final_time, final_objective))
+
+    if not points:
+        return []
+
+    points.sort(key=lambda pair: pair[0])
+    deduped: dict[float, float] = {}
+    for time_value, objective_value in points:
+        previous = deduped.get(time_value)
+        deduped[time_value] = (
+            objective_value if previous is None else min(previous, objective_value)
+        )
+
+    xs = np.fromiter(deduped.keys(), dtype=float)
+    ys = np.fromiter(deduped.values(), dtype=float)
+    ys = np.minimum.accumulate(ys)
+    return [(float(x), float(y)) for x, y in zip(xs, ys)]
+
+
+def collect_method_data(
     dataset: str,
-    n_estimators: int | None = None,
-    max_depth: int | None = 0,
-    seed: int | None = None,
-    model_type: str = "rf",
-) -> tuple[np.ndarray, np.ndarray]:
-    """
-    Load JSON and return two lists: cp_times, mip_times,
-    one entry per instance.
-    """
-    data = []
-    for n in N_ESTIMATORS:
-        for d in MAX_DEPTHS:
-            filename = f"{RESULTS_DIR}{model_type}/exp_{dataset}_{n}_{d}_2.json"
-            try:
-                with open(filename, "r") as f:
-                    data += json.load(f)
-            except FileNotFoundError:
-                # print(f"File not found: {filename}")
-                continue
-    if n_estimators is not None or max_depth != 0 or seed is not None:
-        data = [
-            item
-            for item in data
-            if (item["n_estimators"] == n_estimators if n_estimators else True)
-            and (item["max_depth"] == max_depth if max_depth != 0 else True)
-            and (item["seed"] == seed if seed else True)
-        ]
-    cp_times = []
-    mip_times = []
-    for item in data:
-        cp_list, cp_build = get_method_metrics(item, "cp")
-        mip_list, mip_build = get_method_metrics(item, "mip")
-        cp_build *= ADD_BUILD_TIME
-        mip_build *= ADD_BUILD_TIME
-        if len(cp_list) != len(mip_list):
-            raise ValueError(
-                f"Instance count mismatch: cp has {len(cp_list)}, mip has {len(mip_list)}"
-            )
-        for cp_e, mip_e in zip(cp_list, mip_list):
-            cp_times.append(cp_e["time"] + cp_build)
-            mip_times.append(mip_e["time"] + mip_build)
-    return np.array(cp_times), np.array(mip_times)
-
-
-def load_callbacks(
-    dataset: str,
-    n_estimators: int = None,
-    max_depth: int = None,
-    seed: int = None,
-    model_type: str = "rf",
-) -> tuple[np.ndarray, np.ndarray]:
-    """
-    Load JSON and return two lists: cp_distances, mip_distances,
-    one entry per instance.
-    """
-    data = []
-    for n in N_ESTIMATORS:
-        for d in MAX_DEPTHS:
-            filename = f"{RESULTS_DIR}{model_type}/exp_{dataset}_{n}_{d}_2.json"
-            try:
-                with open(filename, "r") as f:
-                    data += json.load(f)
-            except FileNotFoundError:
-                # print(f"File not found: {filename}")
-                continue
-    if n_estimators is not None or max_depth is not None or seed is not None:
-        data = [
-            item
-            for item in data
-            if (item["n_estimators"] == n_estimators if n_estimators else True)
-            and (item["max_depth"] == max_depth if max_depth else True)
-            and (item["seed"] == seed if seed else True)
-        ]
-    cp_callbacks = []
-    mip_callbacks = []
-    for item in data:
-        cp_list, cp_build = get_method_metrics(item, "cp")
-        mip_list, mip_build = get_method_metrics(item, "mip")
-        cp_build *= ADD_BUILD_TIME
-        mip_build *= ADD_BUILD_TIME
-        if len(cp_list) != len(mip_list):
-            raise ValueError(
-                f"Instance count mismatch: cp has {len(cp_list)}, mip has {len(mip_list)}"
-            )
-        for cp_e, mip_e in zip(cp_list, mip_list):
-            cp_cb = cp_e.get("callback", [])
-            mip_cb = mip_e.get("callback", [])
-            cp_cb.append(
-                {
-                    "objective_value": cp_cb[-1]["objective_value"]
-                    if len(cp_cb) > 0
-                    else None,
-                    "time": cp_e["time"] + cp_build
-                    if len(cp_cb) > 0
-                    and (
-                        cp_e["status"] == "OPTIMAL"
-                    )  # or cp_e["status"] == "FEASIBLE")
-                    else None,
-                },
-            )
-            mip_cb.append(
-                {
-                    "objective_value": mip_cb[-1]["objective_value"]
-                    if len(mip_cb) > 0
-                    else None,
-                    "time": mip_e["time"] + mip_build
-                    if len(mip_cb) > 0
-                    and (
-                        mip_e["status"]
-                        == "OPTIMAL"  # or mip_e["status"] == "TIME_LIMIT"
-                    )
-                    else None,
-                }
-            )
-            cp_callbacks.append(cp_cb)
-            mip_callbacks.append(mip_cb)
-            # if cp_e["status"] != "OPTIMAL":
-            #     print(f"\t CP not optimal for instance {item['n_estimators']}")
-            # if mip_e["status"] != "OPTIMAL":
-            #     print(f"\t MIP not optimal for instance {item['n_estimators']}")
-            if mip_e["status"] == "OPTIMAL" and cp_e["status"] == "OPTIMAL":
-                if not np.isclose(
-                    mip_cb[-1]["objective_value"],
-                    cp_cb[-1]["objective_value"],
-                    atol=1e-2,
-                ):
-                    print(
-                        f"\tObjective values differ for instance {item['n_estimators']}: "
-                        f"CP={cp_cb[-1]['objective_value']}, MIP={mip_cb[-1]['objective_value']}"
-                    )
-    return cp_callbacks, mip_callbacks
-
-
-def aggregate_callbacks(
-    cp_callbacks: list[dict],
-    mip_callbacks: list[dict],
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Normalize distances for each instance and interpolate them on a common time grid.
-    Returns:
-        cp_mean_distances, cp_std_distances, mip_mean_distances, mip_std_distances, common_times
-        each with shape (T,)
-    Notes:
-      - Instances with empty callbacks are ignored in the mean/std (via NaNs).
-      - Single-point series are treated as constant across time.
-      - Extrapolation at the ends is flat (holds endpoint values).
-    """
-    all_times = set()
-    for cb in cp_callbacks:
-        if cb:
-            all_times.update(entry["time"] for entry in cb)
-    for cb in mip_callbacks:
-        if cb:
-            all_times.update(entry["time"] for entry in cb)
-
-    common_times = (
-        np.sort(np.fromiter(all_times, dtype=float))
-        if all_times
-        else np.array([], dtype=float)
+    model_type: str,
+    *,
+    n_estimators: Any = UNSET,
+    max_depth: Any = UNSET,
+    seed: Any = UNSET,
+    voting: Any = UNSET,
+    include_build_time: bool = True,
+) -> ResultBundle:
+    items = filter_items(
+        load_dataset_results(dataset, model_type),
+        n_estimators=n_estimators,
+        max_depth=max_depth,
+        seed=seed,
+        voting=voting,
     )
 
-    if common_times.size == 0:
-        return (np.array([]), np.array([]), np.array([]), np.array([]), common_times)
+    times = {method: [] for method in MODELS}
+    statuses = {method: [] for method in MODELS}
+    has_cfs = {method: [] for method in MODELS}
+    callbacks = {method: [] for method in MODELS}
+    total_instances = 0
 
-    def interp_or_fill(cb: list[dict], times: np.ndarray) -> np.ndarray:
-        """Interpolate one callback onto `times` with robust edge handling."""
-        if not cb:
-            return np.full(times.shape, np.nan)
+    for item in items:
+        parsed = {method: get_method_metrics(item, method) for method in MODELS}
+        lengths = {len(metrics) for metrics, _ in parsed.values()}
+        if len(lengths) > 1:
+            raise ValueError(
+                "Explanation count mismatch in "
+                f"{dataset}/{model_type}: {sorted(lengths)}"
+            )
 
-        xs = np.fromiter((e["time"] for e in cb), dtype=float)
-        ys = np.fromiter((e["objective_value"] for e in cb), dtype=float)
+        n_instances = lengths.pop() if lengths else 0
+        total_instances += n_instances
+        for index in range(n_instances):
+            for method, (metrics, build_time) in parsed.items():
+                metric = metrics[index]
+                has_cf = metric.get("cf") is not None
+                times[method].append(
+                    normalize_elapsed_time(
+                        metric.get("time"),
+                        build_time,
+                        include_build_time=include_build_time,
+                    )
+                )
+                statuses[method].append(metric.get("status"))
+                has_cfs[method].append(has_cf)
+                callbacks[method].append(
+                    []
+                    if not has_cf
+                    else normalize_callback_series(
+                        metric,
+                        build_time,
+                        include_build_time=include_build_time,
+                    )
+                )
 
-        if xs.size == 1:  # constant series
-            return np.full(times.shape, ys[0])
-
-        order = np.argsort(xs)
-        xs = xs[order]
-        ys = ys[order]
-
-        return np.interp(times, xs, ys, left=ys[0], right=ys[-1])
-
-    cp_rows = []
-    mip_rows = []
-    for cp_cb, mip_cb in zip_longest(cp_callbacks, mip_callbacks, fillvalue=None):
-        cp_rows.append(interp_or_fill(cp_cb or [], common_times))
-        mip_rows.append(interp_or_fill(mip_cb or [], common_times))
-
-    cp_interp = np.vstack(cp_rows)  # shape (N, T)
-    mip_interp = np.vstack(mip_rows)
-    assert cp_interp.shape == mip_interp.shape
-    assert cp_interp.shape == (len(cp_callbacks), len(common_times))
-    assert len(cp_interp) > 0
-
-    def joint_normalize(
-        cp_interp: np.ndarray,
-        mip_interp: np.ndarray,
-        mode: str = "global",
-    ) -> tuple[np.ndarray, np.ndarray]:
-        cp = cp_interp.copy()
-        mip = mip_interp.copy()
-
-        if mode not in {"pairwise", "global"}:
-            raise ValueError("mode must be 'pairwise' or 'global'")
-
-        if mode == "pairwise":
-            # compute per-row mins/maxs over the union of the pair
-            mins = np.nanmin(
-                np.dstack([cp, mip]), axis=(1, 2), keepdims=True
-            )  # shape (N,1,1)
-            maxs = np.nanmax(np.dstack([cp, mip]), axis=(1, 2), keepdims=True)
-            # broadcast to row shape
-            mins = np.repeat(mins, cp.shape[1], axis=1)
-            maxs = np.repeat(maxs, cp.shape[1], axis=1)
-
-        else:  # global
-            global_min = np.nanmin([np.nanmin(cp), np.nanmin(mip)])
-            global_max = np.nanmax([np.nanmax(cp), np.nanmax(mip)])
-            mins = np.full_like(cp, global_min)
-            maxs = np.full_like(cp, global_max)
-
-        maxs = np.squeeze(maxs, axis=-1)
-        mins = np.squeeze(mins, axis=-1)
-        rng = maxs - mins
-        # safe range: if rng==0 (or NaN), set to 1 to avoid div-by-zero; we’ll handle all-NaN rows next
-        safe_rng = np.where(np.isfinite(rng) & (rng > 0), rng, 1.0)
-        cp_norm = (cp - mins) / safe_rng
-        mip_norm = (mip - mins) / safe_rng  # same mins/maxs applied to both
-
-        # keep rows that are all-NaN as NaN (no valid data in either CP or MIP)
-        # a row is all-NaN if both cp and mip were all-NaN originally
-        cp_all_nan = np.all(~np.isfinite(cp), axis=1)
-        mip_all_nan = np.all(~np.isfinite(mip), axis=1)
-        both_all_nan = cp_all_nan & mip_all_nan
-        cp_norm[both_all_nan, :] = np.nan
-        mip_norm[both_all_nan, :] = np.nan
-
-        return cp_norm, mip_norm
-
-    cp_norm, mip_norm = joint_normalize(cp_interp, mip_interp, mode="pairwise")
-
-    cp_mean_distances = np.nanmean(cp_norm, axis=0)
-    cp_std_distances = np.nanstd(cp_norm, axis=0)
-    mip_mean_distances = np.nanmean(mip_norm, axis=0)
-    mip_std_distances = np.nanstd(mip_norm, axis=0)
-
-    return (
-        cp_mean_distances,
-        cp_std_distances,
-        mip_mean_distances,
-        mip_std_distances,
-        common_times,
+    return ResultBundle(
+        times={
+            method: np.array(values, dtype=float) for method, values in times.items()
+        },
+        statuses={
+            method: np.array(values, dtype=object)
+            for method, values in statuses.items()
+        },
+        has_cfs={
+            method: np.array(values, dtype=bool) for method, values in has_cfs.items()
+        },
+        callbacks=callbacks,
+        total_instances=total_instances,
     )
+
+
+def finite_plot_times(
+    values: np.ndarray,
+    has_cfs: np.ndarray | None = None,
+    statuses: np.ndarray | None = None,
+    *,
+    require_optimal: bool = True,
+) -> np.ndarray:
+    if values.size == 0:
+        return np.array([], dtype=float)
+    mask = np.isfinite(values) & (values > 0)
+    if has_cfs is not None:
+        if has_cfs.shape[0] != values.shape[0]:
+            raise ValueError("CF mask must align with time array.")
+        mask &= has_cfs
+    if require_optimal:
+        if statuses is None or statuses.shape[0] != values.shape[0]:
+            raise ValueError("Status array must align with time array.")
+        mask &= statuses == "OPTIMAL"
+    return np.sort(values[mask])
+
+
+def valid_time_values(
+    values: np.ndarray,
+    has_cfs: np.ndarray | None = None,
+    statuses: np.ndarray | None = None,
+    *,
+    require_optimal: bool = False,
+) -> np.ndarray:
+    if values.size == 0:
+        return np.array([], dtype=float)
+    mask = np.isfinite(values) & (values > 0)
+    if has_cfs is not None:
+        if has_cfs.shape[0] != values.shape[0]:
+            raise ValueError("CF mask must align with time array.")
+        mask &= has_cfs
+    if require_optimal:
+        if statuses is None or statuses.shape[0] != values.shape[0]:
+            raise ValueError("Status array must align with time array.")
+        mask &= statuses == "OPTIMAL"
+    return values[mask]
 
 
 def compute_performance_profile(
     times_dict: dict[str, np.ndarray],
+    has_cfs_dict: dict[str, np.ndarray],
 ) -> tuple[np.ndarray, dict[str, np.ndarray]]:
-    """
-    Given a dict of {method: times_array}, compute:
-      - ratios[method]: array of ratios per instance
-      - tau_values: sorted unique set of all ratios
-      - profile[method]: fraction solved at each tau
-    """
-    methods = list(times_dict.keys())
-    times = np.vstack([times_dict[m] for m in methods])  # shape (M, N)
-    t_min = times.min(axis=0)  # shape (N,)
-    ratios = {m: times_dict[m] / t_min for m in methods}
+    methods = [
+        method
+        for method in MODELS
+        if has_finite_values(
+            valid_time_values(
+                times_dict.get(method, np.array([], dtype=float)),
+                has_cfs_dict.get(method),
+            )
+        )
+    ]
+    if not methods:
+        return np.array([], dtype=float), {}
 
-    # Choose tau grid: unique ratios sorted
-    all_r = np.concatenate(list(ratios.values()))
-    tau_vals = np.unique(np.sort(all_r))
+    arrays = []
+    for method in methods:
+        times = times_dict[method]
+        has_cfs = has_cfs_dict[method]
+        arrays.append(
+            np.where(
+                np.isfinite(times) & has_cfs,
+                np.maximum(times, EPSILON),
+                np.inf,
+            )
+        )
 
-    profile = {}
-    N = times.shape[1]
-    for m in methods:
-        profile[m] = np.array([np.sum(ratios[m] <= tau) / N for tau in tau_vals])
+    times = np.vstack(arrays)
+    valid_instances = np.isfinite(times).any(axis=0)
+    if not valid_instances.any():
+        return np.array([], dtype=float), {
+            method: np.array([], dtype=float) for method in methods
+        }
 
-    return tau_vals, profile
+    times = times[:, valid_instances]
+    best = np.maximum(np.min(times, axis=0), EPSILON)
+    ratios = {method: row / best for method, row in zip(methods, times)}
 
+    finite_ratios = [
+        ratio[np.isfinite(ratio)]
+        for ratio in ratios.values()
+        if np.isfinite(ratio).any()
+    ]
+    if not finite_ratios:
+        return np.array([], dtype=float), {
+            method: np.array([], dtype=float) for method in methods
+        }
 
-def plot_profile(dataset, tau, profile, model_type: str = "rf"):
-    plt.figure(figsize=(6, 4))
-    for method, rho in profile.items():
-        plt.step(tau, rho, where="post", label=method)
-    plt.xlabel(r"Performance ratio $\tau$")
-    plt.ylabel(r"$\rho(\tau)$: fraction of instances")
-    plt.title("Performance Profile")
-    plt.xlim(1, tau.max())
-    plt.ylim(0, 1.02)
-    plt.grid(True, linestyle="--", alpha=0.5)
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(f"plots/{model_type}/{dataset}/profile.pdf")
-    plt.close()
-
-
-def scatter_plot(dataset, cp_times, mip_times, model_type: str = "rf"):
-    plt.figure(figsize=(5, 5))
-    plt.scatter(cp_times, mip_times, alpha=0.6)
-    # tracer la diagonale y=x
-    lims = [min(cp_times.min(), mip_times.min()), max(cp_times.max(), mip_times.max())]
-    plt.plot(lims, lims, linestyle="--", color="gray")
-    plt.xlabel("Temps CP (s)")
-    plt.ylabel("Temps MIP (s)")
-    plt.title("Scatter CP vs MIP")
-    plt.xscale("log")
-    plt.yscale("log")
-    plt.grid(True, which="both", ls="--", alpha=0.5)
-    plt.tight_layout()
-    plt.savefig(f"plots/{model_type}/{dataset}/scatter.pdf")
-    plt.close()
+    tau_values = np.unique(np.sort(np.concatenate(([1.0], *finite_ratios))))
+    profile = {
+        method: np.array([np.mean(ratio <= tau) for tau in tau_values])
+        for method, ratio in ratios.items()
+    }
+    return tau_values, profile
 
 
-def cactus_plot(dataset, cp_times, mip_times, model_type: str = "rf"):
-    plt.figure(figsize=(6, 4))
-    N = len(cp_times)
-    cp_sorted = np.sort(cp_times)
-    mip_sorted = np.sort(mip_times)
-    # plot: nombre d’instances (1..N) vs temps
-    plt.step(cp_sorted, np.arange(1, N + 1), where="post", label="cp")
-    plt.step(mip_sorted, np.arange(1, N + 1), where="post", label="mip")
-    plt.xlabel("Temps (s)")
-    plt.ylabel("Instances résolues")
-    plt.title("Cactus Plot")
-    plt.xscale("log")
-    plt.legend()
-    plt.grid(True, ls="--", alpha=0.5)
-    plt.tight_layout()
-    plt.savefig(f"plots/{model_type}/{dataset}/cactus.pdf")
-    plt.close()
+def interpolate_callback(
+    callback: list[tuple[float, float]],
+    times: np.ndarray,
+) -> np.ndarray:
+    if not callback:
+        return np.full(times.shape, np.nan)
+
+    xs = np.array([point[0] for point in callback], dtype=float)
+    ys = np.array([point[1] for point in callback], dtype=float)
+
+    if xs.size == 1:
+        return np.full(times.shape, ys[0])
+
+    return np.interp(times, xs, ys, left=ys[0], right=ys[-1])
 
 
-def times_ratio(dataset, cp_times, mip_times, model_type: str = "rf"):
-    ratios = cp_times / mip_times
-    plt.figure(figsize=(6, 4))
-    plt.hist(ratios, bins=30, alpha=0.7)
-    plt.axvline(1, color="black", linestyle="--")
-    plt.xlabel("Ratio CP/MIP")
-    plt.ylabel("Nombre d’instances")
-    plt.title("Histogramme des ratios de temps")
-    plt.grid(True, ls="--", alpha=0.5)
-    plt.tight_layout()
-    plt.savefig(f"plots/{model_type}/{dataset}/ratio_histogram.pdf")
-    plt.close()
+def aggregate_callbacks(
+    callbacks_dict: dict[str, list[list[tuple[float, float]]]],
+) -> tuple[np.ndarray, dict[str, tuple[np.ndarray, np.ndarray]]]:
+    methods = [method for method in MODELS if any(callbacks_dict.get(method, []))]
+    if not methods:
+        return np.array([], dtype=float), {}
+
+    lengths = {len(callbacks_dict[method]) for method in methods}
+    if len(lengths) > 1:
+        raise ValueError(f"Callback count mismatch across methods: {sorted(lengths)}")
+
+    all_times = sorted(
+        {
+            time_value
+            for method in methods
+            for callback in callbacks_dict[method]
+            for time_value, _ in callback
+        }
+    )
+    if not all_times:
+        return np.array([], dtype=float), {}
+
+    common_times = np.array(all_times, dtype=float)
+    interpolated = {
+        method: np.vstack(
+            [
+                interpolate_callback(callback, common_times)
+                for callback in callbacks_dict[method]
+            ]
+        )
+        for method in methods
+    }
+
+    stacked = np.stack([interpolated[method] for method in methods], axis=0)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=RuntimeWarning)
+        mins = np.nanmin(stacked, axis=(0, 2))
+        maxs = np.nanmax(stacked, axis=(0, 2))
+
+    ranges = maxs - mins
+    safe_ranges = np.where(np.isfinite(ranges) & (ranges > 0), ranges, 1.0)
+    no_data_rows = np.all(~np.isfinite(stacked), axis=(0, 2))
+
+    stats: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+    for method in methods:
+        normalized = (interpolated[method] - mins[:, None]) / safe_ranges[:, None]
+        normalized[no_data_rows] = np.nan
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=RuntimeWarning)
+            mean_values = np.nanmean(normalized, axis=0)
+            std_values = np.nanstd(normalized, axis=0)
+        stats[method] = (mean_values, std_values)
+
+    return common_times, stats
 
 
-def cactus_cdf_plot(dataset, cp_times, mip_times, model_type: str = "rf"):
-    plt.figure(figsize=(6, 4))
-    for times, name in [(cp_times, "cp"), (mip_times, "mip")]:
-        ts = np.sort(times)
-        cdf = np.arange(1, len(ts) + 1) / len(ts)
-        plt.step(ts, cdf, where="post", label=name)
-    plt.xlabel("Temps (s)")
-    plt.ylabel("Fraction cumulée")
-    plt.title("Empirical CDF des temps")
-    plt.xscale("log")
-    plt.grid(True, ls="--", alpha=0.5)
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(f"plots/{model_type}/{dataset}/cactus_cdf.pdf")
-    plt.close()
+def plot_profile(
+    dataset: str,
+    tau_values: np.ndarray,
+    profile: dict[str, np.ndarray],
+    *,
+    model_type: str,
+    output_dir: Path,
+) -> None:
+    if tau_values.size == 0 or not profile:
+        return
+
+    figure, ax = plt.subplots(figsize=(6.5, 4.5))
+    for method in MODELS:
+        rho = profile.get(method)
+        if rho is None or rho.size == 0:
+            continue
+        ax.step(
+            tau_values,
+            rho,
+            where="post",
+            label=method_label(method),
+            color=METHOD_COLORS.get(method),
+            linestyle=METHOD_LINESTYLES.get(method, "-"),
+        )
+
+    ax.set_xlabel(r"Performance ratio $\tau$")
+    ax.set_ylabel(r"$\rho(\tau)$")
+    ax.set_title(f"Performance profile ({dataset}, {model_type})")
+    ax.set_xlim(left=1.0)
+    ax.set_ylim(0.0, 1.02)
+    ax.grid(True, linestyle="--", alpha=0.5)
+    ax.legend()
+    figure.tight_layout()
+    figure.savefig(output_dir / "profile.pdf")
+    plt.close(figure)
+
+
+def scatter_plot(
+    dataset: str,
+    left_method: str,
+    right_method: str,
+    times_dict: dict[str, np.ndarray],
+    statuses_dict: dict[str, np.ndarray],
+    has_cfs_dict: dict[str, np.ndarray],
+    *,
+    model_type: str,
+    output_dir: Path,
+) -> None:
+    left_times = times_dict[left_method]
+    right_times = times_dict[right_method]
+    left_statuses = statuses_dict[left_method]
+    right_statuses = statuses_dict[right_method]
+    left_has_cf = has_cfs_dict[left_method]
+    right_has_cf = has_cfs_dict[right_method]
+    mask = (
+        np.isfinite(left_times)
+        & np.isfinite(right_times)
+        & (left_times > 0)
+        & (right_times > 0)
+        # & left_has_cf
+        # & right_has_cf
+    )
+    if not mask.any():
+        return
+
+    xs = left_times[mask]
+    ys = right_times[mask]
+    left_optimal = left_has_cf[mask] & (left_statuses[mask] == "OPTIMAL")
+    right_optimal = right_has_cf[mask] & (right_statuses[mask] == "OPTIMAL")
+    lower = float(min(xs.min(), ys.min()))
+    upper = float(max(xs.max(), ys.max()))
+
+    figure, ax = plt.subplots(figsize=(5.2, 5.2))
+    category_specs = [
+        (
+            left_optimal & right_optimal,
+            "Both OPTIMAL",
+            "o",
+            "#2ca02c",
+        ),
+        (
+            ~left_optimal & right_optimal,
+            f"{method_label(left_method)} non-OPTIMAL only",
+            "X",
+            METHOD_COLORS.get(left_method, "#444444"),
+        ),
+        (
+            left_optimal & ~right_optimal,
+            f"{method_label(right_method)} non-OPTIMAL only",
+            "^",
+            METHOD_COLORS.get(right_method, "#444444"),
+        ),
+        (
+            ~left_optimal & ~right_optimal,
+            "Both non-OPTIMAL",
+            "s",
+            "#7f7f7f",
+        ),
+    ]
+    for category_mask, label, marker, color in category_specs:
+        if not np.any(category_mask):
+            continue
+        ax.scatter(
+            xs[category_mask],
+            ys[category_mask],
+            alpha=0.75,
+            color=color,
+            marker=marker,
+            label=label,
+            edgecolors="black" if marker != "X" else None,
+            linewidths=0.4,
+        )
+    ax.plot([lower, upper], [lower, upper], linestyle="--", color="gray")
+    ax.set_xlabel(f"{method_label(left_method)} time (s)")
+    ax.set_ylabel(f"{method_label(right_method)} time (s)")
+    ax.set_title(
+        f"{method_label(left_method)} vs {method_label(right_method)} ({dataset}, {model_type})"
+    )
+    ax.set_xscale("log")
+    ax.set_yscale("log")
+    ax.grid(True, which="both", linestyle="--", alpha=0.5)
+    ax.legend()
+    figure.tight_layout()
+    figure.savefig(output_dir / f"scatter_{left_method}_vs_{right_method}.pdf")
+    plt.close(figure)
+
+
+def ratio_histogram(
+    dataset: str,
+    numerator_method: str,
+    denominator_method: str,
+    times_dict: dict[str, np.ndarray],
+    has_cfs_dict: dict[str, np.ndarray],
+    *,
+    model_type: str,
+    output_dir: Path,
+) -> None:
+    numerator = times_dict[numerator_method]
+    denominator = times_dict[denominator_method]
+    numerator_has_cf = has_cfs_dict[numerator_method]
+    denominator_has_cf = has_cfs_dict[denominator_method]
+    mask = (
+        np.isfinite(numerator)
+        & np.isfinite(denominator)
+        & (numerator > 0)
+        & (denominator > 0)
+        & numerator_has_cf
+        & denominator_has_cf
+    )
+    if not mask.any():
+        return
+
+    ratios = numerator[mask] / denominator[mask]
+    bins = min(30, max(10, int(np.sqrt(ratios.size))))
+
+    figure, ax = plt.subplots(figsize=(6.5, 4.5))
+    ax.hist(ratios, bins=bins, alpha=0.75, color=METHOD_COLORS.get(numerator_method))
+    ax.axvline(1.0, color="black", linestyle="--")
+    ax.set_xlabel(
+        f"{method_label(numerator_method)} / {method_label(denominator_method)}"
+    )
+    ax.set_ylabel("Instances")
+    ax.set_title(f"Time ratios ({dataset}, {model_type})")
+    ax.grid(True, linestyle="--", alpha=0.5)
+    figure.tight_layout()
+    figure.savefig(
+        output_dir / f"ratio_histogram_{numerator_method}_vs_{denominator_method}.pdf"
+    )
+    plt.close(figure)
+
+
+def remove_stale_ratio_histograms(
+    output_dir: Path,
+    active_time_methods: list[str],
+) -> None:
+    allowed_files = {
+        f"ratio_histogram_cp_vs_{method}.pdf"
+        for method in active_time_methods
+        if method != "cp"
+    }
+    for path in output_dir.glob("ratio_histogram_*.pdf"):
+        if path.name in allowed_files:
+            continue
+        try:
+            path.unlink()
+        except OSError as exc:
+            print(f"Could not remove stale histogram {path}: {exc}")
+
+
+def cactus_plot(
+    dataset: str,
+    times_dict: dict[str, np.ndarray],
+    statuses_dict: dict[str, np.ndarray],
+    has_cfs_dict: dict[str, np.ndarray],
+    total_instances: int,
+    *,
+    model_type: str,
+    output_dir: Path,
+    include_build_time: bool,
+    filename: str,
+) -> None:
+    if total_instances == 0:
+        return
+
+    figure, ax = plt.subplots(figsize=(6.5, 4.5))
+    plotted = False
+    for method in MODELS:
+        sorted_times = finite_plot_times(
+            times_dict.get(method, np.array([], dtype=float)),
+            has_cfs_dict.get(method),
+            statuses_dict.get(method),
+            require_optimal=True,
+        )
+        if sorted_times.size == 0:
+            continue
+        solved = np.arange(1, sorted_times.size + 1)
+        ax.step(
+            sorted_times,
+            solved,
+            where="post",
+            label=method_label(method),
+            color=METHOD_COLORS.get(method),
+            linestyle=METHOD_LINESTYLES.get(method, "-"),
+        )
+        plotted = True
+
+    if not plotted:
+        plt.close(figure)
+        return
+
+    ax.set_xlabel("Time (s)")
+    ax.set_ylabel("Solved instances")
+    ax.set_title(
+        f"Cactus plot ({dataset}, {model_type}, {time_mode_label(include_build_time)})"
+    )
+    ax.set_xscale("log")
+    ax.axvline(
+        TIMEOUT, color="black", linestyle="-", alpha=0.65, label=f"{TIMEOUT}s timeout"
+    )
+    ax.grid(True, linestyle="--", alpha=0.5)
+    ax.legend()
+    figure.tight_layout()
+    figure.savefig(output_dir / filename)
+    plt.close(figure)
+
+
+def cactus_cdf_plot(
+    dataset: str,
+    times_dict: dict[str, np.ndarray],
+    statuses_dict: dict[str, np.ndarray],
+    has_cfs_dict: dict[str, np.ndarray],
+    total_instances: int,
+    *,
+    model_type: str,
+    output_dir: Path,
+    include_build_time: bool,
+    filename: str,
+) -> None:
+    if total_instances == 0:
+        return
+
+    figure, ax = plt.subplots(figsize=(6.5, 4.5))
+    plotted = False
+    for method in MODELS:
+        sorted_times = finite_plot_times(
+            times_dict.get(method, np.array([], dtype=float)),
+            has_cfs_dict.get(method),
+            statuses_dict.get(method),
+            require_optimal=True,
+        )
+        if sorted_times.size == 0:
+            continue
+        cdf = np.arange(1, sorted_times.size + 1) / total_instances
+        ax.step(
+            sorted_times,
+            cdf,
+            where="post",
+            label=method_label(method),
+            color=METHOD_COLORS.get(method),
+            linestyle=METHOD_LINESTYLES.get(method, "-"),
+        )
+        plotted = True
+
+    if not plotted:
+        plt.close(figure)
+        return
+
+    ax.set_xlabel("Time (s)")
+    ax.set_ylabel("Solved fraction")
+    ax.set_title(
+        f"Empirical solved CDF ({dataset}, {model_type}, {time_mode_label(include_build_time)})"
+    )
+    ax.set_xscale("log")
+    ax.set_ylim(0.0, 1.02)
+    ax.axvline(
+        TIMEOUT, color="black", linestyle="-", alpha=0.65, label=f"{TIMEOUT}s timeout"
+    )
+    ax.grid(True, linestyle="--", alpha=0.5)
+    ax.legend()
+    figure.tight_layout()
+    figure.savefig(output_dir / filename)
+    plt.close(figure)
 
 
 def distance_plot(
-    dataset,
-    cp_mean_distances,
-    cp_std_distances,
-    mip_mean_distances,
-    mip_std_distances,
-    common_times,
-    model_type: str = "rf",
-):
-    plt.figure(figsize=(6, 4))
-    plt.plot(common_times, cp_mean_distances, label="cp")
-    plt.fill_between(
-        common_times,
-        np.maximum(cp_mean_distances - cp_std_distances, 0),
-        np.minimum(cp_mean_distances + cp_std_distances, 1),
-        alpha=0.2,
-    )
-    plt.plot(common_times, mip_mean_distances, label="mip")
-    plt.fill_between(
-        common_times,
-        np.maximum(mip_mean_distances - mip_std_distances, 0),
-        np.minimum(mip_mean_distances + mip_std_distances, 1),
-        alpha=0.2,
-    )
-    plt.xlabel("Temps (s)")
-    plt.ylabel("Objective")
-    plt.title("Objective vs Temps")
-    plt.grid(True, ls="--", alpha=0.5)
-    # plt.xscale("log")
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(f"plots/{model_type}/{dataset}/distance_plot.pdf")
-    plt.close()
-
-
-def remove_constant_parts(cp_mean_distances, mip_mean_distances):
-    """
-    Remove constant parts from the end of the distance arrays.
-    Whenever the last value is the same as the second to last,
-    we remove it until the last two values are different.
-    """
-    while 0.0 == cp_mean_distances[-2]:
-        cp_mean_distances = cp_mean_distances[:-1]
-    while 0.0 == mip_mean_distances[-2]:
-        mip_mean_distances = mip_mean_distances[:-1]
-    return cp_mean_distances, mip_mean_distances
-
-
-def estimators_distance_plot(
-    dataset: str, seed: int | None = None, model_type: str = "rf"
-) -> None:
-    __cached__, ax = plt.subplots(figsize=(12, 8))
-    colors = plt.cm.viridis(np.linspace(0, 1, len(N_ESTIMATORS)))
-    for i, n_estimators in enumerate(N_ESTIMATORS[::-1]):
-        cp_callbacks, mip_callbacks = load_callbacks(
-            dataset,
-            n_estimators=n_estimators,
-            seed=seed,
-            model_type=model_type,
-        )
-        (
-            cp_mean_distances,
-            _,
-            mip_mean_distances,
-            _,
-            common_times,
-        ) = aggregate_callbacks(cp_callbacks, mip_callbacks)
-        cp_mean_distances, mip_mean_distances = remove_constant_parts(
-            cp_mean_distances,
-            mip_mean_distances,
-        )
-        ax.plot(
-            common_times[: len(cp_mean_distances)],
-            cp_mean_distances,
-            label=f"cp_{n_estimators}",
-            color=colors[len(N_ESTIMATORS) - 1 - i],
-        )
-        ax.plot(
-            common_times[: len(mip_mean_distances)],
-            mip_mean_distances,
-            label=f"mip_{n_estimators}",
-            linestyle="--",
-            color=colors[len(N_ESTIMATORS) - 1 - i],
-        )
-    ax.set_xlabel("Temps (s)")
-    ax.set_ylabel("Objective")
-    ax.set_title("Objective vs Temps for different n_estimators")
-    ax.grid(True, ls="--", alpha=0.5)
-    # ax.set_xscale("log")
-    ax.legend()
-    plt.tight_layout()
-    plt.savefig(f"plots/{model_type}/{dataset}/estimators_distance_plot.pdf")
-    plt.close()
-
-
-def depth_distance_plot(
     dataset: str,
-    n_estimators: int | None = None,
-    seed: int | None = None,
-    model_type: str = "rf",
+    common_times: np.ndarray,
+    stats: dict[str, tuple[np.ndarray, np.ndarray]],
+    *,
+    model_type: str,
+    output_dir: Path,
 ) -> None:
-    figure, ax = plt.subplots(figsize=(12, 8))
-    colors = plt.cm.viridis(np.linspace(0, 1, len(MAX_DEPTHS)))
-    for i, max_depth in enumerate(MAX_DEPTHS[::-1]):
-        cp_callbacks, mip_callbacks = load_callbacks(
-            dataset,
-            n_estimators=n_estimators,
-            max_depth=max_depth,
-            seed=seed,
-            model_type=model_type,
-        )
-        (
-            cp_mean_distances,
-            _,
-            mip_mean_distances,
-            _,
+    if common_times.size == 0 or not stats:
+        return
+
+    figure, ax = plt.subplots(figsize=(6.8, 4.8))
+    plotted = False
+    for method in MODELS[:2]:  # Focus on CP and MIP for this plot
+        method_stats = stats.get(method)
+        if method_stats is None:
+            continue
+
+        mean_values, std_values = method_stats
+        if not np.isfinite(mean_values).any():
+            continue
+
+        color = METHOD_COLORS.get(method)
+        ax.plot(
             common_times,
-        ) = aggregate_callbacks(cp_callbacks, mip_callbacks)
-        cp_mean_distances, mip_mean_distances = remove_constant_parts(
-            cp_mean_distances,
-            mip_mean_distances,
+            mean_values,
+            label=method_label(method),
+            color=color,
+            linestyle=METHOD_LINESTYLES.get(method, "-"),
         )
-        ax.plot(
-            common_times[: len(cp_mean_distances)],
-            cp_mean_distances,
-            label=f"cp_{max_depth}",
-            color=colors[len(MAX_DEPTHS) - 1 - i],
+        ax.fill_between(
+            common_times,
+            np.clip(mean_values - std_values, 0.0, 1.0),
+            np.clip(mean_values + std_values, 0.0, 1.0),
+            alpha=0.18,
+            color=color,
         )
-        ax.plot(
-            common_times[: len(mip_mean_distances)],
-            mip_mean_distances,
-            label=f"mip_{max_depth}",
-            linestyle="--",
-            color=colors[len(MAX_DEPTHS) - 1 - i],
-        )
-    ax.set_xlabel("Temps (s)")
-    ax.set_ylabel("Objective")
-    ax.set_title("Objective vs Temps for different max_depth")
-    ax.grid(True, ls="--", alpha=0.5)
+        plotted = True
+
+    if not plotted:
+        plt.close(figure)
+        return
+
+    ax.set_xlabel("Time (s)")
+    ax.set_ylabel("Normalized objective")
     ax.set_xscale("log")
+    ax.set_title(f"Objective vs time ({dataset}, {model_type})")
+    ax.grid(True, linestyle="--", alpha=0.5)
     ax.legend()
-    plt.tight_layout()
-    plt.savefig(f"plots/{model_type}/{dataset}/depth_distance_plot.pdf")
-    plt.close()
+    figure.tight_layout()
+    figure.savefig(output_dir / "distance_plot.pdf")
+    plt.close(figure)
 
 
-def plot_times_vs_anything(
+def plot_times_vs_parameter(
     dataset: str,
-    n_estimators: int | None = None,
-    max_depth: int | None = None,
-    seed: int | None = None,
-    model_type: str = "rf",
+    parameter_name: str,
+    parameter_values: list[Any],
+    *,
+    model_type: str,
+    output_dir: Path,
+    n_estimators: Any = UNSET,
+    max_depth: Any = UNSET,
+    seed: Any = UNSET,
+    voting: Any = UNSET,
+    include_build_time: bool,
+    filename: str,
 ) -> None:
-    vs_estimators = n_estimators is None
-    if n_estimators is not None:
-        VS = MAX_DEPTHS
-    elif max_depth is not None:
-        VS = N_ESTIMATORS
-    else:
-        raise ValueError("At least one of n_estimators or max_depth must be provided")
+    medians = {method: [] for method in MODELS}
+    lower_quartiles = {method: [] for method in MODELS}
+    upper_quartiles = {method: [] for method in MODELS}
 
-    avg_cp_times = np.zeros(len(VS))
-    avg_mip_times = np.zeros(len(VS))
-    std_cp_times = np.zeros(len(VS))
-    std_mip_times = np.zeros(len(VS))
-    for i, vs in enumerate(VS):
-        if vs_estimators:
-            n_estimators = vs
-            max_depth = max_depth
-        else:
-            n_estimators = n_estimators
-            max_depth = vs
-        cp_times, mip_times = load_times(
-            dataset, n_estimators=n_estimators, max_depth=max_depth, seed=seed
+    for parameter_value in parameter_values:
+        filters = {
+            "n_estimators": n_estimators,
+            "max_depth": max_depth,
+            "seed": seed,
+            "voting": voting,
+            "include_build_time": include_build_time,
+        }
+        filters[parameter_name] = parameter_value
+        bundle = collect_method_data(dataset, model_type, **filters)
+        for method in MODELS:
+            values = bundle.times[method]
+            finite_values = valid_time_values(
+                values,
+                bundle.has_cfs[method],
+                bundle.statuses[method],
+                require_optimal=True,
+            )
+            if finite_values.size == 0:
+                medians[method].append(np.nan)
+                lower_quartiles[method].append(np.nan)
+                upper_quartiles[method].append(np.nan)
+                continue
+            medians[method].append(float(np.median(finite_values)))
+            lower_quartiles[method].append(float(np.quantile(finite_values, 0.25)))
+            upper_quartiles[method].append(float(np.quantile(finite_values, 0.75)))
+
+    figure, ax = plt.subplots(figsize=(8.0, 5.0))
+    x_values = np.arange(len(parameter_values))
+    plotted = False
+    for method in MODELS:
+        median_values = np.array(medians[method], dtype=float)
+        lower_values = np.array(lower_quartiles[method], dtype=float)
+        upper_values = np.array(upper_quartiles[method], dtype=float)
+        mask = np.isfinite(median_values)
+        if not mask.any():
+            continue
+
+        color = METHOD_COLORS.get(method)
+        ax.plot(
+            x_values[mask],
+            median_values[mask],
+            marker="o",
+            label=method_label(method),
+            color=color,
+            linestyle=METHOD_LINESTYLES.get(method, "-"),
         )
-        # print(
-        #    f"Loaded {len(cp_times)} instances for n_estimators={n_estimators}, max_depth={max_depth}"
-        # )
-        avg_cp_times[i] = np.mean(cp_times)
-        avg_mip_times[i] = np.mean(mip_times)
-        std_cp_times[i] = np.std(cp_times)
-        std_mip_times[i] = np.std(mip_times)
-    print(
-        f"Average CP times: {avg_cp_times}",
-        f"\nStd CP times: {std_cp_times}",
-        f"\nAverage MIP times: {avg_mip_times}",
-        f"\nStd MIP times: {std_mip_times}",
+        ax.fill_between(
+            x_values[mask],
+            np.clip(lower_values[mask], EPSILON, None),
+            np.clip(upper_values[mask], EPSILON, None),
+            alpha=0.18,
+            color=color,
+        )
+        plotted = True
+
+    if not plotted:
+        plt.close(figure)
+        return
+
+    ax.set_xticks(x_values)
+    ax.set_xticklabels([format_parameter_value(value) for value in parameter_values])
+    ax.set_xlabel(PARAMETER_LABELS.get(parameter_name, parameter_name))
+    ax.set_ylabel("Median time (s)")
+    ax.set_yscale("log")
+    ax.axhline(
+        TIMEOUT, color="black", linestyle="-", alpha=0.65, label=f"{TIMEOUT}s timeout"
+    )
+    ax.set_title(
+        f"Median time vs {PARAMETER_LABELS.get(parameter_name, parameter_name).lower()} "
+        f"({dataset}, {model_type}, {time_mode_label(include_build_time)})"
+    )
+    ax.grid(True, linestyle="--", alpha=0.5)
+    ax.legend()
+    figure.tight_layout()
+    figure.savefig(output_dir / filename)
+    plt.close(figure)
+
+
+def plot_distance_by_parameter(
+    dataset: str,
+    parameter_name: str,
+    parameter_values: list[Any],
+    *,
+    model_type: str,
+    output_dir: Path,
+    filename: str,
+    n_estimators: Any = UNSET,
+    max_depth: Any = UNSET,
+    seed: Any = UNSET,
+    voting: Any = UNSET,
+) -> None:
+    parameter_series: list[
+        tuple[Any, np.ndarray, dict[str, tuple[np.ndarray, np.ndarray]]]
+    ] = []
+    active_methods: set[str] = set()
+
+    for parameter_value in parameter_values:
+        filters = {
+            "n_estimators": n_estimators,
+            "max_depth": max_depth,
+            "seed": seed,
+            "voting": voting,
+        }
+        filters[parameter_name] = parameter_value
+        bundle = collect_method_data(dataset, model_type, **filters)
+        common_times, stats = aggregate_callbacks(bundle.callbacks)
+        if common_times.size == 0 or not stats:
+            continue
+        parameter_series.append((parameter_value, common_times, stats))
+        active_methods.update(stats)
+
+    ordered_methods = [method for method in MODELS[:2] if method in active_methods]
+    if not ordered_methods:
+        return
+
+    figure, axis = plt.subplots(1, 1, figsize=(7.0, 4.2), squeeze=False)
+    colors = plt.cm.viridis(np.linspace(0, 1, len(parameter_series)))
+    axis = axis.flat[0]
+    parameter_legend_handles: dict[Any, Any] = {}
+
+    for method in ordered_methods:
+        for color, (parameter_value, common_times, stats) in zip(
+            colors, parameter_series
+        ):
+            method_stats = stats.get(method)
+            if method_stats is None:
+                continue
+
+            mean_values, _ = method_stats
+            if not np.isfinite(mean_values).any():
+                continue
+
+            line = axis.plot(
+                common_times,
+                mean_values,
+                color=color,
+                label=format_parameter_value(parameter_value),
+                linestyle=METHOD_LINESTYLES.get(method, "-"),
+            )[0]
+            parameter_legend_handles.setdefault(parameter_value, line)
+
+    axis.set_xlabel("Time (s)")
+    axis.set_ylabel("Normalized objective")
+    axis.set_xscale("log")
+    axis.grid(True, linestyle="--", alpha=0.5)
+
+    legend_handles = [
+        parameter_legend_handles[parameter_value]
+        for parameter_value, _, _ in parameter_series
+        if parameter_value in parameter_legend_handles
+    ]
+    legend_labels = [
+        format_parameter_value(parameter_value)
+        for parameter_value, _, _ in parameter_series
+        if parameter_value in parameter_legend_handles
+    ]
+    if legend_handles:
+        for method in ordered_methods:
+            method_line = axis.plot(
+                [],
+                [],
+                color="black",
+                linestyle=METHOD_LINESTYLES.get(method, "-"),
+                label=METHOD_LABELS.get(method, method),
+            )[0]
+            legend_handles.append(method_line)
+            legend_labels.append(METHOD_LABELS.get(method, method))
+
+        figure.legend(
+            legend_handles,
+            legend_labels,
+            loc="upper center",
+            ncol=min(len(legend_labels), 6),
+            title=PARAMETER_LABELS.get(parameter_name, parameter_name),
+        )
+        figure.tight_layout(rect=(0.0, 0.0, 1.0, 0.92))
+    else:
+        figure.tight_layout(rect=(0.0, 0.0, 1.0, 0.95))
+    figure.savefig(output_dir / filename)
+    plt.close(figure)
+
+
+def generate_plots_for_dataset(
+    dataset: str,
+    model_type: str,
+    voting: str | None = None,
+) -> None:
+    normalized_voting = normalize_voting(model_type, voting)
+    output_dir = ensure_output_dir(dataset, model_type, normalized_voting)
+    estimators_reference_depth = select_reference_value(
+        dataset,
+        model_type,
+        fixed_parameter_name="max_depth",
+        preferred_value=7,
+        varying_parameter_name="n_estimators",
+        varying_values=N_ESTIMATORS,
+        voting=normalized_voting,
+    )
+    depth_reference_estimators = select_reference_value(
+        dataset,
+        model_type,
+        fixed_parameter_name="n_estimators",
+        preferred_value=100,
+        varying_parameter_name="max_depth",
+        varying_values=MAX_DEPTHS,
+        voting=normalized_voting,
+    )
+    bundle_with_build = collect_method_data(
+        dataset,
+        model_type,
+        voting=normalized_voting,
+        include_build_time=True,
+    )
+    bundle_without_build = collect_method_data(
+        dataset,
+        model_type,
+        voting=normalized_voting,
+        include_build_time=False,
     )
 
-    plt.figure(figsize=(8, 6))
-    plt.plot(range(len(VS)), avg_cp_times, label="CP", marker="o")
-    plt.fill_between(
-        range(len(VS)),
-        avg_cp_times - std_cp_times,
-        avg_cp_times + std_cp_times,
-        alpha=0.2,
+    if bundle_with_build.total_instances == 0:
+        print(
+            f"No results found for {dataset}/{model_type}/{normalized_voting.lower()}."
+        )
+        return
+
+    active_time_methods = bundle_with_build.active_time_methods
+    remove_stale_ratio_histograms(output_dir, active_time_methods)
+    if active_time_methods:
+        cactus_plot(
+            dataset,
+            bundle_without_build.times,
+            bundle_without_build.statuses,
+            bundle_without_build.has_cfs,
+            bundle_without_build.total_instances,
+            model_type=model_type,
+            output_dir=output_dir,
+            include_build_time=False,
+            filename="cactus.pdf",
+        )
+        cactus_plot(
+            dataset,
+            bundle_with_build.times,
+            bundle_with_build.statuses,
+            bundle_with_build.has_cfs,
+            bundle_with_build.total_instances,
+            model_type=model_type,
+            output_dir=output_dir,
+            include_build_time=True,
+            filename="cactus_with_build.pdf",
+        )
+        cactus_cdf_plot(
+            dataset,
+            bundle_without_build.times,
+            bundle_without_build.statuses,
+            bundle_without_build.has_cfs,
+            bundle_without_build.total_instances,
+            model_type=model_type,
+            output_dir=output_dir,
+            include_build_time=False,
+            filename="cactus_cdf.pdf",
+        )
+        cactus_cdf_plot(
+            dataset,
+            bundle_with_build.times,
+            bundle_with_build.statuses,
+            bundle_with_build.has_cfs,
+            bundle_with_build.total_instances,
+            model_type=model_type,
+            output_dir=output_dir,
+            include_build_time=True,
+            filename="cactus_cdf_with_build.pdf",
+        )
+
+        tau_values, profile = compute_performance_profile(
+            {method: bundle_with_build.times[method] for method in active_time_methods},
+            {
+                method: bundle_with_build.has_cfs[method]
+                for method in active_time_methods
+            },
+        )
+        plot_profile(
+            dataset,
+            tau_values,
+            profile,
+            model_type=model_type,
+            output_dir=output_dir,
+        )
+
+        for left_method, right_method in combinations(active_time_methods, 2):
+            scatter_plot(
+                dataset,
+                left_method,
+                right_method,
+                bundle_with_build.times,
+                bundle_with_build.statuses,
+                bundle_with_build.has_cfs,
+                model_type=model_type,
+                output_dir=output_dir,
+            )
+
+        if "cp" in active_time_methods:
+            for other_method in active_time_methods:
+                if other_method == "cp":
+                    continue
+                ratio_histogram(
+                    dataset,
+                    "cp",
+                    other_method,
+                    bundle_with_build.times,
+                    bundle_with_build.has_cfs,
+                    model_type=model_type,
+                    output_dir=output_dir,
+                )
+
+        plot_times_vs_parameter(
+            dataset,
+            "n_estimators",
+            N_ESTIMATORS,
+            model_type=model_type,
+            output_dir=output_dir,
+            max_depth=estimators_reference_depth,
+            voting=normalized_voting,
+            include_build_time=False,
+            filename="times_vs_estimators.pdf",
+        )
+        plot_times_vs_parameter(
+            dataset,
+            "n_estimators",
+            N_ESTIMATORS,
+            model_type=model_type,
+            output_dir=output_dir,
+            max_depth=estimators_reference_depth,
+            voting=normalized_voting,
+            include_build_time=True,
+            filename="times_vs_estimators_with_build.pdf",
+        )
+        plot_times_vs_parameter(
+            dataset,
+            "max_depth",
+            MAX_DEPTHS,
+            model_type=model_type,
+            output_dir=output_dir,
+            n_estimators=depth_reference_estimators,
+            voting=normalized_voting,
+            include_build_time=False,
+            filename="times_vs_depth.pdf",
+        )
+        plot_times_vs_parameter(
+            dataset,
+            "max_depth",
+            MAX_DEPTHS,
+            model_type=model_type,
+            output_dir=output_dir,
+            n_estimators=depth_reference_estimators,
+            voting=normalized_voting,
+            include_build_time=True,
+            filename="times_vs_depth_with_build.pdf",
+        )
+
+    common_times, stats = aggregate_callbacks(bundle_with_build.callbacks)
+    distance_plot(
+        dataset,
+        common_times,
+        stats,
+        model_type=model_type,
+        output_dir=output_dir,
     )
-    plt.plot(range(len(VS)), avg_mip_times, label="MIP", marker="o", linestyle="--")
-    plt.fill_between(
-        range(len(VS)),
-        avg_mip_times - std_mip_times,
-        avg_mip_times + std_mip_times,
-        alpha=0.2,
+
+    plot_distance_by_parameter(
+        dataset,
+        "n_estimators",
+        N_ESTIMATORS,
+        model_type=model_type,
+        output_dir=output_dir,
+        seed=2,
+        filename="estimators_distance_plot.pdf",
+        max_depth=estimators_reference_depth,
+        voting=normalized_voting,
     )
-    plt.xticks(range(len(VS)), VS if vs_estimators else VS[:-1] + ["None"])
-    plt.xlabel("Number of Trees" if vs_estimators else "Max Depth")
-    plt.ylabel("Average Time (s)")
-    plt.yscale("log")
-    plt.title(
-        "Average Time vs " + ("Number of Trees" if vs_estimators else "Max Depth")
+    plot_distance_by_parameter(
+        dataset,
+        "max_depth",
+        MAX_DEPTHS,
+        model_type=model_type,
+        output_dir=output_dir,
+        n_estimators=depth_reference_estimators,
+        filename="depth_distance_plot.pdf",
+        voting=normalized_voting,
     )
-    plt.grid(True, ls="--", alpha=0.5)
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(
-        f"plots/{model_type}/{dataset}/times_vs_"
-        + ("estimators" if vs_estimators else "depth")
-        + ".pdf"
-    )
-    plt.close()
 
 
 def main() -> None:
-    # dataset = "Adult"
-    # model_type = "rf"
     for dataset in DATASETS:
-        for model_type in ["rf", "xgb"]:
-            cp_times, mip_times = load_times(dataset, model_type=model_type)
-            scatter_plot(dataset, cp_times, mip_times, model_type=model_type)
-            cactus_plot(dataset, cp_times, mip_times, model_type=model_type)
-            times_ratio(dataset, cp_times, mip_times, model_type=model_type)
-            cactus_cdf_plot(dataset, cp_times, mip_times, model_type=model_type)
-            print("First plots done!")
-
-            times_dict = {"cp": cp_times, "mip": mip_times}
-            tau, profile = compute_performance_profile(times_dict)
-            plot_profile(dataset, tau, profile, model_type=model_type)
-
-            cp_callbacks, mip_callbacks = load_callbacks(dataset, model_type=model_type)
-            (
-                cp_mean_distances,
-                cp_std_distances,
-                mip_mean_distances,
-                mip_std_distances,
-                common_times,
-            ) = aggregate_callbacks(cp_callbacks, mip_callbacks)
-            distance_plot(
-                dataset,
-                cp_mean_distances,
-                cp_std_distances,
-                mip_mean_distances,
-                mip_std_distances,
-                common_times,
-                model_type=model_type,
-            )
-            estimators_distance_plot(dataset, seed=2, model_type=model_type)
-            depth_distance_plot(dataset, n_estimators=200, model_type=model_type)
-            plot_times_vs_anything(dataset, n_estimators=200, model_type=model_type)
-            plot_times_vs_anything(dataset, max_depth=9, model_type=model_type)
+        for model_type in ("rf", "xgb"):
+            votings = VOTING if model_type == "rf" else ["SOFT"]
+            for voting in votings:
+                print(
+                    "Generating plots for dataset:",
+                    dataset,
+                    "model type:",
+                    model_type,
+                    "voting:",
+                    voting,
+                )
+                generate_plots_for_dataset(dataset, model_type, voting=voting)
 
 
 if __name__ == "__main__":

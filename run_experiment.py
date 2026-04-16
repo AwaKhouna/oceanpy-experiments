@@ -5,6 +5,7 @@ import json
 import time
 import logging
 import argparse
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Tuple, Literal
 import gurobipy as gp
@@ -19,6 +20,9 @@ from parameters import (
     MODELS,
     N_ESTIMATORS,
     MAX_DEPTHS,
+    DEFAULT_N_ESTIMATORS,
+    DEFAULT_MAX_DEPTH,
+    VOTING,
     TIMEOUT,
     N_SAMPLES,
 )
@@ -37,6 +41,16 @@ from ocean.typing import BaseExplainableEnsemble
 warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")
 logger = logging.getLogger(__name__)
 METHOD_RESULT_KEYS = ("objective", "cf", "status", "time", "valid", "callback")
+SETUPS = ("setup1", "setup2")
+
+
+@dataclass(frozen=True)
+class ExperimentSpec:
+    dataset: str
+    seed: int
+    method: str
+    voting: Literal["SOFT", "HARD"]
+    setup: str
 
 ## For compatibility with ortools 9.10 and earlier versions
 if ortools.__version__ < "9.11":
@@ -83,32 +97,193 @@ def set_thread_envvars(threads: int) -> None:
         os.environ[var] = str(threads)
 
 
+def available_methods(model_type: Literal["rf", "xgb"]) -> List[str]:
+    if model_type == "xgb":
+        return [method for method in MODELS if method != "mace"]
+    return list(MODELS)
+
+
+def normalize_voting(
+    voting: str | None,
+    model_type: Literal["rf", "xgb"],
+) -> Literal["SOFT", "HARD"]:
+    if model_type == "xgb":
+        if voting is not None and voting.upper() != "SOFT":
+            raise ValueError("XGBoost experiments only support SOFT voting.")
+        return "SOFT"
+    if voting is None:
+        return "SOFT"
+    normalized = voting.upper()
+    if normalized not in VOTING:
+        raise ValueError(f"Unknown voting type: {voting}")
+    return normalized  # type: ignore[return-value]
+
+
+def get_result_filename(
+    dataset: str,
+    n_estimators: int,
+    max_depth: int,
+    seed: int,
+    *,
+    model_type: Literal["rf", "xgb"],
+    voting: str | None = None,
+) -> str:
+    normalized_voting = normalize_voting(voting, model_type)
+    suffix = "_HARD" if model_type == "rf" and normalized_voting == "HARD" else ""
+    return f"{model_type}/exp_{dataset}_{n_estimators}_{max_depth}_{seed}{suffix}.json"
+
+
+def result_identity(result: Dict[str, Any]) -> Tuple[Any, ...]:
+    return (
+        result.get("dataset"),
+        result.get("model_type"),
+        result.get("n_estimators"),
+        result.get("max_depth"),
+        result.get("seed"),
+        result.get("voting", "SOFT"),
+    )
+
+
+def result_methods(result: Dict[str, Any]) -> List[str]:
+    return [method for method in MODELS if f"{method}_build_time" in result]
+
+
+def merge_result_entry(
+    existing: Dict[str, Any],
+    incoming: Dict[str, Any],
+    methods_to_merge: List[str],
+) -> Dict[str, Any]:
+    merged = dict(existing)
+    for field in (
+        "dataset",
+        "model_type",
+        "n_estimators",
+        "max_depth",
+        "split_levels",
+        "nodes",
+        "seed",
+        "threads",
+        "accuracy",
+        "n_features",
+        "voting",
+    ):
+        if field in incoming:
+            merged[field] = incoming[field]
+
+    existing_explanations = merged.get("explanations")
+    incoming_explanations = incoming.get("explanations")
+    if not isinstance(existing_explanations, list) or not existing_explanations:
+        merged["explanations"] = incoming_explanations
+        existing_explanations = merged.get("explanations")
+
+    if not isinstance(existing_explanations, list) or not isinstance(
+        incoming_explanations, list
+    ):
+        raise ValueError("Expected list-based explanations when merging results.")
+
+    if len(existing_explanations) != len(incoming_explanations):
+        raise ValueError(
+            "Explanation count mismatch while merging saved results: "
+            f"{len(existing_explanations)} vs {len(incoming_explanations)}"
+        )
+
+    for existing_explanation, incoming_explanation in zip(
+        existing_explanations, incoming_explanations
+    ):
+        if existing_explanation.get("query") != incoming_explanation.get("query"):
+            raise ValueError("Query mismatch while merging saved results.")
+        if existing_explanation.get("target") != incoming_explanation.get("target"):
+            raise ValueError("Target mismatch while merging saved results.")
+        for method in methods_to_merge:
+            for key in METHOD_RESULT_KEYS:
+                metric_key = f"{method}_{key}"
+                existing_explanation[metric_key] = incoming_explanation.get(metric_key)
+
+    for method in methods_to_merge:
+        build_time_key = f"{method}_build_time"
+        if build_time_key in incoming:
+            merged[build_time_key] = incoming[build_time_key]
+        supported_key = f"{method}_supported"
+        reason_key = f"{method}_reason"
+        if supported_key in incoming:
+            merged[supported_key] = incoming[supported_key]
+        else:
+            merged.pop(supported_key, None)
+        if reason_key in incoming:
+            merged[reason_key] = incoming[reason_key]
+        else:
+            merged.pop(reason_key, None)
+    return merged
+
+
+def coalesce_results(entries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    merged: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
+    order: List[Tuple[Any, ...]] = []
+    for entry in entries:
+        key = result_identity(entry)
+        if key not in merged:
+            merged[key] = entry
+            order.append(key)
+            continue
+        merged[key] = merge_result_entry(merged[key], entry, result_methods(entry))
+    return [merged[key] for key in order]
+
+
+def load_results_file(results_path: Path) -> List[Dict[str, Any]]:
+    if not results_path.exists():
+        return []
+    with open(results_path, "r") as f:
+        payload = json.load(f)
+    if not isinstance(payload, list):
+        raise ValueError(f"Unexpected results payload in {results_path}: {type(payload)}")
+    return coalesce_results([item for item in payload if isinstance(item, dict)])
+
+
+def setup_configurations(setup: str) -> List[Tuple[int, int]]:
+    if setup == "setup1":
+        return [(DEFAULT_N_ESTIMATORS, max_depth) for max_depth in MAX_DEPTHS]
+    if setup == "setup2":
+        return [(n_estimators, DEFAULT_MAX_DEPTH) for n_estimators in N_ESTIMATORS]
+    raise ValueError(f"Unknown setup: {setup}")
+
+
 def check_experiment(
     dataset: str,
     n_estimators: int,
     max_depth: int,
     seed: int,
     model_type: Literal["rf", "xgb"] = "rf",
+    voting: str | None = None,
+    methods: List[str] | None = None,
 ) -> bool:
-    filename = f"{model_type}/exp_{dataset}_{n_estimators}_{max_depth}_{seed}.json"
+    selected_methods = methods or available_methods(model_type)
+    normalized_voting = normalize_voting(voting, model_type)
+    filename = get_result_filename(
+        dataset,
+        n_estimators,
+        max_depth,
+        seed,
+        model_type=model_type,
+        voting=normalized_voting,
+    )
     results_path = Path(f"results/{filename}")
     if not results_path.exists():
         return False
 
-    with open(results_path, "r") as f:
-        results = json.load(f)
-
-    for res in results:
+    for res in load_results_file(results_path):
         explanations = res.get("explanations")
         has_all_methods = False
         if isinstance(explanations, dict):
-            has_all_methods = all(method in explanations for method in MODELS)
+            has_all_methods = all(method in explanations for method in selected_methods)
         elif isinstance(explanations, list):
-            has_all_methods = all(f"{method}_build_time" in res for method in MODELS)
+            has_all_methods = all(
+                f"{method}_build_time" in res for method in selected_methods
+            )
         if (
             res["n_estimators"] == n_estimators
             and res["max_depth"] == max_depth
             and res["seed"] == seed
+            and res.get("voting", "SOFT") == normalized_voting
             and has_all_methods
         ):
             return True
@@ -122,6 +297,7 @@ def make_explainer(
     data: pd.DataFrame | None = None,
     target: pd.Series | None = None,
     dataset_name: str | None = None,
+    voting: Literal["SOFT", "HARD"] = "SOFT",
 ) -> Any:
     t0 = time.time()
     if explainer_type == "cp":
@@ -134,7 +310,11 @@ def make_explainer(
         exp = MixedIntegerProgramExplainer(model, mapper=mapper, env=env)
 
     elif explainer_type == "maxsat":
-        exp = MaxSATExplainer(model, mapper=mapper)
+        exp = MaxSATExplainer(
+            model,
+            mapper=mapper,
+            hard_voting=voting == "HARD",
+        )
 
     elif explainer_type == "mace":
         if data is None or target is None:
@@ -273,6 +453,7 @@ def get_performance_metrics(
     seed: int,
     threads: int,
     dataset_name: str,
+    voting: Literal["SOFT", "HARD"] = "SOFT",
     test_data: pd.DataFrame | None = None,
     targets: List[int] | None = None,
 ) -> Tuple[List[Dict[str, Any]], float]:
@@ -283,6 +464,7 @@ def get_performance_metrics(
         data=data,
         target=target,
         dataset_name=dataset_name,
+        voting=voting,
     )
     metrics: List[Dict[str, Any]] = []
     if test_data is None:
@@ -323,18 +505,23 @@ def run_experiment(
     threads: int,
     filename: str,
     model_type: Literal["rf", "xgb"] = "rf",
+    voting: str | None = None,
+    methods: List[str] | None = None,
 ) -> Dict[str, Any]:
+    selected_methods = methods or available_methods(model_type)
+    normalized_voting = normalize_voting(voting, model_type)
     logger.info(
-        "Dataset=%s | n_estimators=%d | max_depth=%s | seed=%d | threads=%d",
+        "Dataset=%s | n_estimators=%d | max_depth=%s | seed=%d | voting=%s | threads=%d",
         dataset_path,
         n_estimators,
         max_depth,
         seed,
+        normalized_voting,
         threads,
     )
     print(
         f"Running experiment on {dataset_path} with n_estimators={n_estimators}, "
-        f"max_depth={max_depth}, seed={seed}, threads={threads}"
+        f"max_depth={max_depth}, seed={seed}, voting={normalized_voting}, threads={threads}"
     )
 
     (X, y), mapper = load_dataset(dataset_path)
@@ -346,6 +533,7 @@ def run_experiment(
         max_depth=max_depth,
         seed=seed,
         model_type=model_type,
+        voting=normalized_voting,
     )
     acc = model.score(X, y)
     test_data = X.sample(n=N_SAMPLES, random_state=seed) if N_SAMPLES < len(X) else X
@@ -365,12 +553,13 @@ def run_experiment(
         "split_levels": get_split_levels(model),
         "nodes": get_node_count(model),
         "seed": seed,
+        "voting": normalized_voting,
         "threads": threads,
         "accuracy": acc,
         "n_features": X.shape[1],
         "explanations": initialize_explanations(test_data, targets),
     }
-    for j, expl_type in enumerate(MODELS):
+    for j, expl_type in enumerate(selected_methods):
         print(f"\t Explaining with :{expl_type}")
         if expl_type == "mace" and model_type != "rf":
             placeholder = make_mace_placeholder(
@@ -390,6 +579,7 @@ def run_experiment(
                     seed,
                     threads,
                     dataset_path,
+                    voting=normalized_voting,
                     test_data=test_data,
                     targets=targets,
                 )
@@ -407,7 +597,7 @@ def run_experiment(
                 out[f"{expl_type}_reason"] = placeholder["reason"]
         if j >= 1:
             check_results(out, model)
-        save_results(out, filename=filename, overwrite=True)
+        save_results(out, filename=filename, methods_to_merge=[expl_type])
     return out
 
 
@@ -421,8 +611,9 @@ def check_results(results: Dict[str, Any], model: BaseExplainableEnsemble) -> No
             explanation["cp_objective"] is not None
             and explanation["mip_objective"] is not None
         ):
-            if abs(explanation["cp_objective"] - explanation["mip_objective"]) >= 1e-2:
-                print_rf_splits_levels(model)
+            if abs(explanation["cp_objective"] - explanation["mip_objective"]) >= 1e-4:
+                if results["model_type"] == "rf":
+                    print_rf_splits_levels(model)
                 msg = (
                     "Objective values differ: "
                     f"{explanation['cp_objective']:.4f} vs {explanation['mip_objective']:.4f} \n"
@@ -437,24 +628,61 @@ def check_results(results: Dict[str, Any], model: BaseExplainableEnsemble) -> No
 def save_results(
     results: Dict[str, Any],
     filename: str,
-    overwrite: bool = False,
+    methods_to_merge: List[str] | None = None,
 ) -> None:
     results_path = Path(f"results/{filename}")
-    new_res: List[Dict[str, Any]] = []
-    if results_path.exists() and not overwrite:
-        with open(results_path, "r") as f:
-            new_res += json.load(f)
-    new_res.append(results)
-    results_path.write_text(json.dumps(new_res, indent=2))
+    results_path.parent.mkdir(parents=True, exist_ok=True)
+    new_res = load_results_file(results_path) if results_path.exists() else []
+    if methods_to_merge is None:
+        new_res.append(results)
+        payload = coalesce_results(new_res)
+    else:
+        payload = []
+        merged_entry = results
+        merged = False
+        for existing in new_res:
+            if result_identity(existing) != result_identity(results):
+                payload.append(existing)
+                continue
+            merged_entry = merge_result_entry(existing, results, methods_to_merge)
+            payload.append(merged_entry)
+            merged = True
+        if not merged:
+            payload.append(results)
+    results_path.write_text(json.dumps(payload, indent=2))
     logger.info("Results saved to %s", results_path)
 
 
-def get_experiment_params(id: int) -> Tuple[str, int, int, int | None]:
-    sd = SEEDS[id // (len(DATASETS) * len(N_ESTIMATORS) * len(MAX_DEPTHS))]
-    ds = DATASETS[id // (len(N_ESTIMATORS) * len(MAX_DEPTHS)) % len(DATASETS)]
-    ne = N_ESTIMATORS[(id // len(MAX_DEPTHS)) % len(N_ESTIMATORS)]
-    md = MAX_DEPTHS[id % len(MAX_DEPTHS)]
-    return ds, ne, md, sd
+def get_total_experiments(model_type: Literal["rf", "xgb"]) -> int:
+    methods = available_methods(model_type)
+    voting_count = len(VOTING) if model_type == "rf" else 1
+    return len(DATASETS) * len(SEEDS) * len(methods) * voting_count * len(SETUPS)
+
+
+def get_experiment_params(
+    id: int,
+    model_type: Literal["rf", "xgb"],
+) -> ExperimentSpec:
+    methods = available_methods(model_type)
+    setups_per_method = len(SETUPS)
+    votings = list(VOTING) if model_type == "rf" else ["SOFT"]
+    configs_per_dataset = len(methods) * len(votings) * setups_per_method
+    configs_per_seed = len(DATASETS) * configs_per_dataset
+
+    sd = SEEDS[id // configs_per_seed]
+    dataset_offset = id % configs_per_seed
+    ds = DATASETS[dataset_offset // configs_per_dataset]
+    config_offset = dataset_offset % configs_per_dataset
+    method = methods[config_offset // (len(votings) * setups_per_method)]
+    voting_index = (config_offset // setups_per_method) % len(votings)
+    setup = SETUPS[config_offset % setups_per_method]
+    return ExperimentSpec(
+        dataset=ds,
+        seed=sd,
+        method=method,
+        voting=normalize_voting(votings[voting_index], model_type),
+        setup=setup,
+    )
 
 
 def run_experiments(
@@ -463,7 +691,16 @@ def run_experiments(
     model_type: Literal["rf", "xgb"] = "rf",
     force: bool = False,
     overwrite: bool = False,
+    methods: List[str] | None = None,
 ) -> None:
+    spec = get_experiment_params(experiment_id, model_type)
+    selected_methods = [spec.method]
+    if methods is not None:
+        if len(methods) != 1 or methods[0] != spec.method:
+            raise ValueError(
+                "Experiment IDs now fix a single explainer method. "
+                f"Experiment {experiment_id + 1} maps to method '{spec.method}'."
+            )
     if threads > os.cpu_count():
         raise ValueError(
             f"Requested {threads} threads, but only {os.cpu_count()} are available."
@@ -480,45 +717,70 @@ def run_experiments(
         "Total CPUs=%d",
         threads,
     )
-
-    ds, ne, md, sd = get_experiment_params(experiment_id)
-    filename = f"{model_type}/exp_{ds}_{ne}_{md}_{sd}.json"
-    results_path = Path(f"results/{filename}")
-
-    if (
-        not force
-        and not overwrite
-        and check_experiment(ds, ne, md, sd, model_type=model_type)
-    ):
-        logger.info("Experiment %d already completed", experiment_id)
-        print(
-            f"Experiment {experiment_id + 1} already completed for {ds} "
-            f"(n_estimators={ne}, max_depth={md}, seed={sd}). "
-            "Use --force to rerun or --overwrite to replace the saved file."
-        )
-        return
-
-    if overwrite and results_path.exists():
-        results_path.unlink()
-        logger.info("Deleted existing results file %s", results_path)
-        print(f"Overwriting existing results file {results_path}")
-
+    configurations = setup_configurations(spec.setup)
     print(
-        f"Running experiment {experiment_id} with dataset {ds},",
-        f" n_estimators={ne}, max_depth={md}, seed={sd}, threads={threads}",
-    )
-    _ = run_experiment(
-        dataset_path=ds,
-        n_estimators=ne,
-        max_depth=md,
-        seed=sd,
-        threads=threads,
-        model_type=model_type,
-        filename=filename,
+        f"Running experiment {experiment_id + 1} with dataset={spec.dataset}, "
+        f"seed={spec.seed}, method={spec.method}, voting={spec.voting}, setup={spec.setup}"
     )
 
-    # Path("results.json").write_text(json.dumps(all_results, indent=2))
-    logger.info(f"Experiment {experiment_id} is done — wrote results to {filename}")
+    completed = 0
+    skipped = 0
+    for n_estimators, max_depth in configurations:
+        filename = get_result_filename(
+            spec.dataset,
+            n_estimators,
+            max_depth,
+            spec.seed,
+            model_type=model_type,
+            voting=spec.voting,
+        )
+        already_done = check_experiment(
+            spec.dataset,
+            n_estimators,
+            max_depth,
+            spec.seed,
+            model_type=model_type,
+            voting=spec.voting,
+            methods=selected_methods,
+        )
+        if already_done and not force and not overwrite:
+            skipped += 1
+            logger.info(
+                "Skipping completed configuration: dataset=%s seed=%d method=%s voting=%s setup=%s n_estimators=%d max_depth=%d",
+                spec.dataset,
+                spec.seed,
+                spec.method,
+                spec.voting,
+                spec.setup,
+                n_estimators,
+                max_depth,
+            )
+            continue
+
+        _ = run_experiment(
+            dataset_path=spec.dataset,
+            n_estimators=n_estimators,
+            max_depth=max_depth,
+            seed=spec.seed,
+            threads=threads,
+            model_type=model_type,
+            filename=filename,
+            voting=spec.voting,
+            methods=selected_methods,
+        )
+        completed += 1
+
+    logger.info(
+        "Experiment %d finished: dataset=%s seed=%d method=%s voting=%s setup=%s completed=%d skipped=%d",
+        experiment_id + 1,
+        spec.dataset,
+        spec.seed,
+        spec.method,
+        spec.voting,
+        spec.setup,
+        completed,
+        skipped,
+    )
 
 
 def print_rf_splits_levels(model: BaseExplainableEnsemble) -> None:
@@ -539,7 +801,7 @@ def main() -> int:
         "-e",
         type=int,
         default=1,
-        help="Experiment ID (default: 1, between 1 and 900)",
+        help="Experiment ID (1-indexed within the selected model type).",
     )
     parser.add_argument(
         "--threads",
@@ -564,13 +826,22 @@ def main() -> int:
     parser.add_argument(
         "--overwrite",
         action="store_true",
-        help="Delete the existing results file for this experiment before rerunning.",
+        help="Rerun this experiment and replace the selected method results.",
+    )
+    parser.add_argument(
+        "--methods",
+        nargs="+",
+        choices=MODELS,
+        default=None,
+        help="Optional validation override. Must match the method fixed by the experiment ID.",
     )
 
     args = parser.parse_args()
-    if not (1 <= args.experiment <= 900):
+    total_experiments = get_total_experiments(args.model_type)
+    if not (1 <= args.experiment <= total_experiments):
         raise ValueError(
-            f"Experiment ID must be between 1 and 900, got {args.experiment}"
+            f"Experiment ID must be between 1 and {total_experiments} for "
+            f"model type '{args.model_type}', got {args.experiment}"
         )
 
     run_experiments(
@@ -579,6 +850,7 @@ def main() -> int:
         args.model_type,
         args.force,
         args.overwrite,
+        args.methods,
     )
     return 0
 

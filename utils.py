@@ -1,6 +1,7 @@
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import accuracy_score
 import pandas as pd
+import numpy as np
 from ocean.feature import parse_features
 from ocean.typing import BaseExplainableEnsemble
 from typing import Dict, List, Literal
@@ -49,8 +50,9 @@ def train_model(
     y: pd.Series,
     model_type: Literal["rf", "xgb"] = "rf",
     n_estimators: int = 100,
-    max_depth: int = None,
+    max_depth: int | None = None,
     seed: int = 42,
+    voting: Literal["SOFT", "HARD"] = "SOFT",
     return_accuracy: bool = False,
 ) -> BaseExplainableEnsemble | tuple[BaseExplainableEnsemble, float]:
     """
@@ -71,12 +73,17 @@ def train_model(
             random_state=seed,
         )
     elif model_type == "xgb":
+        if voting != "SOFT":
+            raise ValueError("XGBoost experiments only support SOFT voting.")
         model = XGBClassifier(
             n_estimators=n_estimators,
             max_depth=max_depth,
             random_state=seed,
         )
     model.fit(data, y)
+    if model_type == "rf" and voting == "HARD":
+        set_rf_hard_voting_values(model)
+    setattr(model, "_ocean_voting", voting)
 
     if return_accuracy:
         predictions = model.predict(data)
@@ -84,6 +91,17 @@ def train_model(
         return model, accuracy
 
     return model
+
+
+def set_rf_hard_voting_values(model: RandomForestClassifier) -> None:
+    for estimator in model.estimators_:
+        tree = estimator.tree_
+        leaf_ids = np.flatnonzero(tree.children_left == tree.children_right)
+        for node_id in leaf_ids:
+            winners = np.argmax(tree.value[node_id], axis=1)
+            tree.value[node_id] = 0.0
+            for output_idx, winner in enumerate(winners):
+                tree.value[node_id, output_idx, winner] = 1.0
 
 
 def get_split_levels(model: BaseExplainableEnsemble) -> Dict[str, int]:
