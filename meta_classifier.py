@@ -226,8 +226,14 @@ def infer_voting_type(path: Path, entry: dict[str, Any], model_type: str) -> str
     return "SOFT"
 
 
+def is_supported_result_file(path: Path) -> bool:
+    return path.name.startswith(("exp_", "multinorms_", "isolation_"))
+
+
 def iter_result_entries(results_dir: Path) -> Iterable[tuple[Path, dict[str, Any]]]:
-    for path in sorted(results_dir.rglob("exp_*.json")):
+    for path in sorted(results_dir.rglob("*.json")):
+        if not is_supported_result_file(path):
+            continue
         try:
             payload = json.loads(path.read_text())
         except (OSError, json.JSONDecodeError) as exc:
@@ -274,25 +280,27 @@ def dataset_feature_type_counts(
     }
 
 
-def has_counterfactual(explanation: dict[str, Any], method: str) -> bool:
-    return explanation.get(f"{method}_cf") is not None
+def has_counterfactual(explanation: dict[str, Any], metric_prefix: str) -> bool:
+    return explanation.get(f"{metric_prefix}_cf") is not None
 
 
-def is_valid_counterfactual(explanation: dict[str, Any], method: str) -> bool:
-    return explanation.get(f"{method}_valid") is True
+def is_valid_counterfactual(explanation: dict[str, Any], metric_prefix: str) -> bool:
+    return explanation.get(f"{metric_prefix}_valid") is True
 
 
-def summarize_method(
+def summarize_prefixed_method(
     entry: dict[str, Any],
     method: str,
     *,
+    metric_prefix: str,
+    build_time_key: str,
     require_optimal: bool,
 ) -> MethodSummary | None:
     explanations = entry.get("explanations")
     if not isinstance(explanations, list) or not explanations:
         return None
 
-    build_time = finite_nonnegative_float(entry.get(f"{method}_build_time"))
+    build_time = finite_nonnegative_float(entry.get(build_time_key))
     supported = entry.get(f"{method}_supported", True)
     if supported is False and build_time is None:
         return None
@@ -304,20 +312,22 @@ def summarize_method(
     for explanation in explanations:
         if not isinstance(explanation, dict):
             continue
-        time_value = finite_nonnegative_float(explanation.get(f"{method}_time"))
+        time_value = finite_nonnegative_float(
+            explanation.get(f"{metric_prefix}_time")
+        )
         method_was_attempted = (
-            time_value is not None or f"{method}_status" in explanation
+            time_value is not None or f"{metric_prefix}_status" in explanation
         )
         if method_was_attempted:
             attempted_count += 1
         if time_value is not None:
             times.append(time_value)
 
-        status = explanation.get(f"{method}_status")
+        status = explanation.get(f"{metric_prefix}_status")
         optimal_enough = (not require_optimal) or is_optimal_status(status)
         if (
-            has_counterfactual(explanation, method)
-            and is_valid_counterfactual(explanation, method)
+            has_counterfactual(explanation, metric_prefix)
+            and is_valid_counterfactual(explanation, metric_prefix)
             and optimal_enough
         ):
             success_count += 1
@@ -335,6 +345,21 @@ def summarize_method(
         n_samples=len(explanations),
         success_count=success_count,
         attempted_count=attempted_count,
+    )
+
+
+def summarize_method(
+    entry: dict[str, Any],
+    method: str,
+    *,
+    require_optimal: bool,
+) -> MethodSummary | None:
+    return summarize_prefixed_method(
+        entry,
+        method,
+        metric_prefix=method,
+        build_time_key=f"{method}_build_time",
+        require_optimal=require_optimal,
     )
 
 
@@ -371,6 +396,258 @@ def choose_best_method(
     )
 
 
+def metric_suffix(value: Any) -> str:
+    numeric_value = finite_float(value)
+    if numeric_value is not None and numeric_value.is_integer():
+        return str(int(numeric_value))
+    return str(value)
+
+
+def configured_methods(entry: dict[str, Any]) -> list[str]:
+    raw_methods = entry.get("methods")
+    if isinstance(raw_methods, list):
+        return [method for method in METHODS if method in raw_methods]
+    return [method for method in METHODS if f"{method}_build_time" in entry]
+
+
+def row_from_summaries(
+    *,
+    path: Path,
+    entry: dict[str, Any],
+    dataset: str,
+    type_counts: dict[str, float | None],
+    summaries: dict[str, MethodSummary],
+    norm: float,
+    isolation: int,
+    ranking_policy: str,
+) -> dict[str, Any] | None:
+    if not summaries:
+        return None
+
+    n_samples = max(summary.n_samples for summary in summaries.values())
+    best_method = choose_best_method(
+        summaries,
+        n_samples=n_samples,
+        ranking_policy=ranking_policy,
+    )
+    if best_method is None:
+        return None
+
+    model_type = infer_model_type(path, entry)
+    voting_type = infer_voting_type(path, entry, model_type)
+
+    time_limit = finite_nonnegative_float(entry.get("timeout"))
+    if time_limit is None:
+        time_limit = float(TIMEOUT)
+
+    n_features = finite_nonnegative_float(entry.get("n_features"))
+    if n_features is None:
+        typed_counts = [value for value in type_counts.values() if value is not None]
+        n_features = float(sum(typed_counts)) if typed_counts else None
+
+    return {
+        "dataset": dataset,
+        "best_explainer": normalize_method_label(best_method),
+        "n_features": n_features,
+        "model_type": model_type,
+        "voting_type": voting_type,
+        "n_estimators": optional_int(entry.get("n_estimators")),
+        "max_depth": optional_int(entry.get("max_depth")),
+        "time_limit": time_limit,
+        "norm": norm,
+        "isolation": isolation,
+        "n_samples": n_samples,
+        **type_counts,
+        **model_complexity_features(entry),
+    }
+
+
+def collect_standard_entry_rows(
+    *,
+    path: Path,
+    entry: dict[str, Any],
+    dataset: str,
+    type_counts: dict[str, float | None],
+    require_optimal: bool,
+    ranking_policy: str,
+) -> list[dict[str, Any]]:
+    summaries = {
+        method: summary
+        for method in METHODS
+        if (
+            summary := summarize_method(
+                entry,
+                method,
+                require_optimal=require_optimal,
+            )
+        )
+        is not None
+    }
+    row = row_from_summaries(
+        path=path,
+        entry=entry,
+        dataset=dataset,
+        type_counts=type_counts,
+        summaries=summaries,
+        norm=infer_norm(entry),
+        isolation=infer_isolation(path, entry),
+        ranking_policy=ranking_policy,
+    )
+    return [] if row is None else [row]
+
+
+def collect_multinorm_entry_rows(
+    *,
+    path: Path,
+    entry: dict[str, Any],
+    dataset: str,
+    type_counts: dict[str, float | None],
+    require_optimal: bool,
+    ranking_policy: str,
+) -> list[dict[str, Any]]:
+    raw_norms = entry.get("norms")
+    if not isinstance(raw_norms, list):
+        return []
+
+    rows: list[dict[str, Any]] = []
+    methods = configured_methods(entry)
+    for raw_norm in raw_norms:
+        norm = finite_nonnegative_float(raw_norm)
+        if norm is None:
+            continue
+
+        summaries = {
+            method: summary
+            for method in methods
+            if (
+                summary := summarize_prefixed_method(
+                    entry,
+                    method,
+                    metric_prefix=f"{method}_{metric_suffix(raw_norm)}",
+                    build_time_key=f"{method}_build_time",
+                    require_optimal=require_optimal,
+                )
+            )
+            is not None
+        }
+        row = row_from_summaries(
+            path=path,
+            entry=entry,
+            dataset=dataset,
+            type_counts=type_counts,
+            summaries=summaries,
+            norm=norm,
+            isolation=0,
+            ranking_policy=ranking_policy,
+        )
+        if row is not None:
+            rows.append(row)
+
+    return rows
+
+
+def parse_isolation_variant(variant: Any) -> tuple[str, int] | None:
+    if not isinstance(variant, str) or "_" not in variant:
+        return None
+    method, suffix = variant.rsplit("_", 1)
+    if method not in METHODS:
+        return None
+    if suffix == "plain":
+        return method, 0
+    if suffix in {"iso", "isolation"}:
+        return method, 1
+    return None
+
+
+def collect_isolation_entry_rows(
+    *,
+    path: Path,
+    entry: dict[str, Any],
+    dataset: str,
+    type_counts: dict[str, float | None],
+    require_optimal: bool,
+    ranking_policy: str,
+) -> list[dict[str, Any]]:
+    raw_variants = entry.get("variants")
+    if not isinstance(raw_variants, list):
+        raw_variants = [
+            key[: -len("_build_time")]
+            for key in entry
+            if key.endswith("_build_time") and "_" in key[: -len("_build_time")]
+        ]
+
+    grouped_summaries: dict[int, dict[str, MethodSummary]] = {}
+    for variant in raw_variants:
+        parsed = parse_isolation_variant(variant)
+        if parsed is None:
+            continue
+        method, isolation = parsed
+        summary = summarize_prefixed_method(
+            entry,
+            method,
+            metric_prefix=str(variant),
+            build_time_key=f"{variant}_build_time",
+            require_optimal=require_optimal,
+        )
+        if summary is not None:
+            grouped_summaries.setdefault(isolation, {})[method] = summary
+
+    rows: list[dict[str, Any]] = []
+    norm = infer_norm(entry)
+    for isolation, summaries in sorted(grouped_summaries.items()):
+        row = row_from_summaries(
+            path=path,
+            entry=entry,
+            dataset=dataset,
+            type_counts=type_counts,
+            summaries=summaries,
+            norm=norm,
+            isolation=isolation,
+            ranking_policy=ranking_policy,
+        )
+        if row is not None:
+            rows.append(row)
+
+    return rows
+
+
+def collect_entry_rows(
+    *,
+    path: Path,
+    entry: dict[str, Any],
+    dataset: str,
+    type_counts: dict[str, float | None],
+    require_optimal: bool,
+    ranking_policy: str,
+) -> list[dict[str, Any]]:
+    if "variants" in entry or path.name.startswith("isolation_"):
+        return collect_isolation_entry_rows(
+            path=path,
+            entry=entry,
+            dataset=dataset,
+            type_counts=type_counts,
+            require_optimal=require_optimal,
+            ranking_policy=ranking_policy,
+        )
+    if "norms" in entry or path.name.startswith("multinorms_"):
+        return collect_multinorm_entry_rows(
+            path=path,
+            entry=entry,
+            dataset=dataset,
+            type_counts=type_counts,
+            require_optimal=require_optimal,
+            ranking_policy=ranking_policy,
+        )
+    return collect_standard_entry_rows(
+        path=path,
+        entry=entry,
+        dataset=dataset,
+        type_counts=type_counts,
+        require_optimal=require_optimal,
+        ranking_policy=ranking_policy,
+    )
+
+
 def collect_training_data(
     *,
     results_dir: Path,
@@ -386,68 +663,21 @@ def collect_training_data(
         if not isinstance(dataset, str):
             continue
 
-        model_type = infer_model_type(path, entry)
-        voting_type = infer_voting_type(path, entry, model_type)
         type_counts = feature_count_cache.setdefault(
             dataset,
             dataset_feature_type_counts(dataset, datasets_dir=datasets_dir),
         )
 
-        summaries = {
-            method: summary
-            for method in METHODS
-            if (
-                summary := summarize_method(
-                    entry,
-                    method,
-                    require_optimal=require_optimal,
-                )
+        rows.extend(
+            collect_entry_rows(
+                path=path,
+                entry=entry,
+                dataset=dataset,
+                type_counts=type_counts,
+                require_optimal=require_optimal,
+                ranking_policy=ranking_policy,
             )
-            is not None
-        }
-        if not summaries:
-            continue
-
-        n_samples = max(summary.n_samples for summary in summaries.values())
-        best_method = choose_best_method(
-            summaries,
-            n_samples=n_samples,
-            ranking_policy=ranking_policy,
         )
-        if best_method is None:
-            continue
-
-        time_limit = finite_nonnegative_float(entry.get("timeout"))
-        if time_limit is None:
-            time_limit = float(TIMEOUT)
-
-        n_features = finite_nonnegative_float(entry.get("n_features"))
-        if n_features is None:
-            typed_counts = [
-                value for value in type_counts.values() if value is not None
-            ]
-            n_features = float(sum(typed_counts)) if typed_counts else None
-
-        max_depth = optional_int(entry.get("max_depth"))
-        n_estimators = optional_int(entry.get("n_estimators"))
-
-        row: dict[str, Any] = {
-            "dataset": dataset,
-            "best_explainer": normalize_method_label(best_method),
-            "n_features": n_features,
-            "model_type": model_type,
-            "voting_type": voting_type,
-            "n_estimators": n_estimators,
-            "max_depth": max_depth,
-            "time_limit": time_limit,
-            "norm": infer_norm(entry),
-            "isolation": infer_isolation(path, entry),
-            "n_samples": n_samples,
-            **type_counts,
-            **model_complexity_features(entry),
-        }
-
-        rows.append(row)
 
     return pd.DataFrame(rows, columns=CSV_COLUMNS)
 
