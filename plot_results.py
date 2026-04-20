@@ -7,7 +7,6 @@ import json
 import warnings
 from dataclasses import dataclass
 from functools import lru_cache
-from itertools import combinations
 from pathlib import Path
 
 # from tempfile import gettempdir
@@ -39,6 +38,7 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
 
 
 EPSILON = 1e-12
@@ -93,10 +93,6 @@ def method_label(method: str) -> str:
 
 def format_parameter_value(value: Any) -> str:
     return "None" if value is None else str(value)
-
-
-def time_mode_label(include_build_time: bool) -> str:
-    return "with build time" if include_build_time else "solver time only"
 
 
 def has_finite_values(values: np.ndarray | None) -> bool:
@@ -690,7 +686,6 @@ def plot_profile(
 
     ax.set_xlabel(r"Performance ratio $\tau$")
     ax.set_ylabel(r"$\rho(\tau)$")
-    ax.set_title(f"Performance profile ({dataset}, {model_type})")
     ax.set_xlim(left=1.0)
     ax.set_ylim(0.0, 1.02)
     ax.grid(True, linestyle="--", alpha=0.5)
@@ -778,9 +773,6 @@ def scatter_plot(
     ax.plot([lower, upper], [lower, upper], linestyle="--", color="gray")
     ax.set_xlabel(f"{method_label(left_method)} time (s)")
     ax.set_ylabel(f"{method_label(right_method)} time (s)")
-    ax.set_title(
-        f"{method_label(left_method)} vs {method_label(right_method)} ({dataset}, {model_type})"
-    )
     ax.set_xscale("log")
     ax.set_yscale("log")
     ax.grid(True, which="both", linestyle="--", alpha=0.5)
@@ -788,68 +780,6 @@ def scatter_plot(
     figure.tight_layout()
     figure.savefig(output_dir / f"scatter_{left_method}_vs_{right_method}.pdf")
     plt.close(figure)
-
-
-def ratio_histogram(
-    dataset: str,
-    numerator_method: str,
-    denominator_method: str,
-    times_dict: dict[str, np.ndarray],
-    has_cfs_dict: dict[str, np.ndarray],
-    *,
-    model_type: str,
-    output_dir: Path,
-) -> None:
-    numerator = times_dict[numerator_method]
-    denominator = times_dict[denominator_method]
-    numerator_has_cf = has_cfs_dict[numerator_method]
-    denominator_has_cf = has_cfs_dict[denominator_method]
-    mask = (
-        np.isfinite(numerator)
-        & np.isfinite(denominator)
-        & (numerator > 0)
-        & (denominator > 0)
-        & numerator_has_cf
-        & denominator_has_cf
-    )
-    if not mask.any():
-        return
-
-    ratios = numerator[mask] / denominator[mask]
-    bins = min(30, max(10, int(np.sqrt(ratios.size))))
-
-    figure, ax = plt.subplots(figsize=(6.5, 4.5))
-    ax.hist(ratios, bins=bins, alpha=0.75, color=METHOD_COLORS.get(numerator_method))
-    ax.axvline(1.0, color="black", linestyle="--")
-    ax.set_xlabel(
-        f"{method_label(numerator_method)} / {method_label(denominator_method)}"
-    )
-    ax.set_ylabel("Instances")
-    ax.set_title(f"Time ratios ({dataset}, {model_type})")
-    ax.grid(True, linestyle="--", alpha=0.5)
-    figure.tight_layout()
-    figure.savefig(
-        output_dir / f"ratio_histogram_{numerator_method}_vs_{denominator_method}.pdf"
-    )
-    plt.close(figure)
-
-
-def remove_stale_ratio_histograms(
-    output_dir: Path,
-    active_time_methods: list[str],
-) -> None:
-    allowed_files = {
-        f"ratio_histogram_cp_vs_{method}.pdf"
-        for method in active_time_methods
-        if method != "cp"
-    }
-    for path in output_dir.glob("ratio_histogram_*.pdf"):
-        if path.name in allowed_files:
-            continue
-        try:
-            path.unlink()
-        except OSError as exc:
-            print(f"Could not remove stale histogram {path}: {exc}")
 
 
 def cactus_plot(
@@ -895,9 +825,6 @@ def cactus_plot(
 
     ax.set_xlabel("Time (s)")
     ax.set_ylabel("Solved instances")
-    ax.set_title(
-        f"Cactus plot ({dataset}, {model_type}, {time_mode_label(include_build_time)})"
-    )
     ax.set_xscale("log")
     ax.axvline(
         TIMEOUT, color="black", linestyle="-", alpha=0.65, label=f"{TIMEOUT}s timeout"
@@ -952,9 +879,6 @@ def cactus_cdf_plot(
 
     ax.set_xlabel("Time (s)")
     ax.set_ylabel("Solved fraction")
-    ax.set_title(
-        f"Empirical solved CDF ({dataset}, {model_type}, {time_mode_label(include_build_time)})"
-    )
     ax.set_xscale("log")
     ax.set_ylim(0.0, 1.02)
     ax.axvline(
@@ -1013,7 +937,6 @@ def distance_plot(
     ax.set_xlabel("Time (s)")
     ax.set_ylabel("Normalized objective")
     ax.set_xscale("log")
-    ax.set_title(f"Objective vs time ({dataset}, {model_type})")
     ax.grid(True, linestyle="--", alpha=0.5)
     ax.legend()
     figure.tight_layout()
@@ -1107,14 +1030,55 @@ def plot_times_vs_parameter(
     ax.axhline(
         TIMEOUT, color="black", linestyle="-", alpha=0.65, label=f"{TIMEOUT}s timeout"
     )
-    ax.set_title(
-        f"Median time vs {PARAMETER_LABELS.get(parameter_name, parameter_name).lower()} "
-        f"({dataset}, {model_type}, {time_mode_label(include_build_time)})"
-    )
     ax.grid(True, linestyle="--", alpha=0.5)
     ax.legend()
     figure.tight_layout()
     figure.savefig(output_dir / filename)
+    plt.close(figure)
+
+
+def save_distance_legend(
+    parameter_name: str,
+    parameter_colors: dict[Any, Any],
+    ordered_methods: list[str],
+    *,
+    output_dir: Path,
+    filename: str,
+) -> None:
+    parameter_label = PARAMETER_LABELS.get(parameter_name, parameter_name)
+    handles = [
+        Line2D(
+            [0],
+            [0],
+            color=color,
+            linestyle="-",
+            label=f"{parameter_label}: {format_parameter_value(parameter_value)}",
+        )
+        for parameter_value, color in parameter_colors.items()
+    ]
+    handles.extend(
+        Line2D(
+            [0],
+            [0],
+            color="black",
+            linestyle=METHOD_LINESTYLES.get(method, "-"),
+            label=METHOD_LABELS.get(method, method),
+        )
+        for method in ordered_methods
+    )
+    if not handles:
+        return
+
+    figure, ax = plt.subplots(figsize=(7.0, 1.4))
+    ax.axis("off")
+    ax.legend(
+        handles=handles,
+        loc="center",
+        ncol=min(len(handles), 4),
+        frameon=False,
+    )
+    figure.tight_layout()
+    figure.savefig(output_dir / filename, bbox_inches="tight")
     plt.close(figure)
 
 
@@ -1126,6 +1090,7 @@ def plot_distance_by_parameter(
     model_type: str,
     output_dir: Path,
     filename: str,
+    legend_filename: str,
     n_estimators: Any = UNSET,
     max_depth: Any = UNSET,
     seed: Any = UNSET,
@@ -1158,7 +1123,8 @@ def plot_distance_by_parameter(
     figure, axis = plt.subplots(1, 1, figsize=(7.0, 4.2), squeeze=False)
     colors = plt.cm.viridis(np.linspace(0, 1, len(parameter_series)))
     axis = axis.flat[0]
-    parameter_legend_handles: dict[Any, Any] = {}
+    parameter_colors: dict[Any, Any] = {}
+    plotted = False
 
     for method in ordered_methods:
         for color, (parameter_value, common_times, stats) in zip(
@@ -1172,54 +1138,34 @@ def plot_distance_by_parameter(
             if not np.isfinite(mean_values).any():
                 continue
 
-            line = axis.plot(
+            axis.plot(
                 common_times,
                 mean_values,
                 color=color,
                 label=format_parameter_value(parameter_value),
                 linestyle=METHOD_LINESTYLES.get(method, "-"),
-            )[0]
-            parameter_legend_handles.setdefault(parameter_value, line)
+            )
+            parameter_colors.setdefault(parameter_value, color)
+            plotted = True
+
+    if not plotted:
+        plt.close(figure)
+        return
 
     axis.set_xlabel("Time (s)")
     axis.set_ylabel("Normalized objective")
     axis.set_xscale("log")
     axis.grid(True, linestyle="--", alpha=0.5)
-
-    legend_handles = [
-        parameter_legend_handles[parameter_value]
-        for parameter_value, _, _ in parameter_series
-        if parameter_value in parameter_legend_handles
-    ]
-    legend_labels = [
-        format_parameter_value(parameter_value)
-        for parameter_value, _, _ in parameter_series
-        if parameter_value in parameter_legend_handles
-    ]
-    if legend_handles:
-        for method in ordered_methods:
-            method_line = axis.plot(
-                [],
-                [],
-                color="black",
-                linestyle=METHOD_LINESTYLES.get(method, "-"),
-                label=METHOD_LABELS.get(method, method),
-            )[0]
-            legend_handles.append(method_line)
-            legend_labels.append(METHOD_LABELS.get(method, method))
-
-        figure.legend(
-            legend_handles,
-            legend_labels,
-            loc="upper center",
-            ncol=min(len(legend_labels), 6),
-            title=PARAMETER_LABELS.get(parameter_name, parameter_name),
-        )
-        figure.tight_layout(rect=(0.0, 0.0, 1.0, 0.92))
-    else:
-        figure.tight_layout(rect=(0.0, 0.0, 1.0, 0.95))
+    figure.tight_layout()
     figure.savefig(output_dir / filename)
     plt.close(figure)
+    save_distance_legend(
+        parameter_name,
+        parameter_colors,
+        ordered_methods,
+        output_dir=output_dir,
+        filename=legend_filename,
+    )
 
 
 def generate_plots_for_dataset(
@@ -1267,7 +1213,6 @@ def generate_plots_for_dataset(
         return
 
     active_time_methods = bundle_with_build.active_time_methods
-    remove_stale_ratio_histograms(output_dir, active_time_methods)
     if active_time_methods:
         cactus_plot(
             dataset,
@@ -1329,27 +1274,16 @@ def generate_plots_for_dataset(
             output_dir=output_dir,
         )
 
-        for left_method, right_method in combinations(active_time_methods, 2):
-            scatter_plot(
-                dataset,
-                left_method,
-                right_method,
-                bundle_with_build.times,
-                bundle_with_build.statuses,
-                bundle_with_build.has_cfs,
-                model_type=model_type,
-                output_dir=output_dir,
-            )
-
         if "cp" in active_time_methods:
             for other_method in active_time_methods:
                 if other_method == "cp":
                     continue
-                ratio_histogram(
+                scatter_plot(
                     dataset,
                     "cp",
                     other_method,
                     bundle_with_build.times,
+                    bundle_with_build.statuses,
                     bundle_with_build.has_cfs,
                     model_type=model_type,
                     output_dir=output_dir,
@@ -1417,6 +1351,7 @@ def generate_plots_for_dataset(
         output_dir=output_dir,
         seed=2,
         filename="estimators_distance_plot.pdf",
+        legend_filename="estimators_distance_legend.pdf",
         max_depth=estimators_reference_depth,
         voting=normalized_voting,
     )
@@ -1428,6 +1363,7 @@ def generate_plots_for_dataset(
         output_dir=output_dir,
         n_estimators=depth_reference_estimators,
         filename="depth_distance_plot.pdf",
+        legend_filename="depth_distance_legend.pdf",
         voting=normalized_voting,
     )
 

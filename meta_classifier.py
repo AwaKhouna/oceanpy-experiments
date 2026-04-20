@@ -4,23 +4,21 @@ from __future__ import annotations
 import argparse
 import json
 import math
-
-# import os
+import os
 from dataclasses import dataclass
 from pathlib import Path
-
-# from tempfile import gettempdir
+from tempfile import gettempdir
 from typing import Any, Iterable
 
 import numpy as np
 import pandas as pd
 from sklearn.compose import ColumnTransformer
 from sklearn.impute import SimpleImputer
-from sklearn.metrics import classification_report
+from sklearn.metrics import accuracy_score, classification_report
 from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder
-from sklearn.tree import DecisionTreeClassifier, plot_tree
+from sklearn.tree import DecisionTreeClassifier, _tree, plot_tree
 
 try:
     import joblib
@@ -33,12 +31,12 @@ except Exception:  # pragma: no cover - keeps the script usable outside the repo
     TIMEOUT = 900
 
 
-# _CACHE_DIR = Path(gettempdir()) / "oceanpy-meta-classifier-cache"
-# _CACHE_DIR.mkdir(parents=True, exist_ok=True)
-# (_CACHE_DIR / "matplotlib").mkdir(parents=True, exist_ok=True)
-# (_CACHE_DIR / "xdg-cache").mkdir(parents=True, exist_ok=True)
-# os.environ.setdefault("MPLCONFIGDIR", str(_CACHE_DIR / "matplotlib"))
-# os.environ.setdefault("XDG_CACHE_HOME", str(_CACHE_DIR / "xdg-cache"))
+_CACHE_DIR = Path(gettempdir()) / "oceanpy-meta-classifier-cache"
+_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+(_CACHE_DIR / "matplotlib").mkdir(parents=True, exist_ok=True)
+(_CACHE_DIR / "xdg-cache").mkdir(parents=True, exist_ok=True)
+os.environ.setdefault("MPLCONFIGDIR", str(_CACHE_DIR / "matplotlib"))
+os.environ.setdefault("XDG_CACHE_HOME", str(_CACHE_DIR / "xdg-cache"))
 
 import matplotlib
 
@@ -468,6 +466,199 @@ def make_one_hot_encoder() -> OneHotEncoder:
         return OneHotEncoder(handle_unknown="ignore", sparse=False)
 
 
+def make_preprocessor() -> ColumnTransformer:
+    numeric_transformer = Pipeline(
+        steps=[
+            ("imputer", SimpleImputer(strategy="median")),
+        ]
+    )
+    categorical_transformer = Pipeline(
+        steps=[
+            ("imputer", SimpleImputer(strategy="most_frequent")),
+            ("onehot", make_one_hot_encoder()),
+        ]
+    )
+    return ColumnTransformer(
+        transformers=[
+            ("num", numeric_transformer, NUMERIC_FEATURES),
+            ("cat", categorical_transformer, CATEGORICAL_FEATURES),
+        ]
+    )
+
+
+def save_trained_model(model: Pipeline, model_output: Path | None) -> None:
+    if model_output is None:
+        return
+    if joblib is None:
+        print("joblib is not available; skipping model export.")
+        return
+    model_output.parent.mkdir(parents=True, exist_ok=True)
+    joblib.dump(model, model_output)
+
+
+def parse_optional_int_grid(spec: str) -> list[int | None]:
+    values: list[int | None] = []
+    for raw_value in spec.split(","):
+        value = raw_value.strip()
+        if not value:
+            continue
+        if value.lower() in {"none", "null"}:
+            values.append(None)
+        else:
+            values.append(int(value))
+    if not values:
+        raise ValueError(f"Empty integer grid: {spec!r}")
+    return values
+
+
+def parse_int_grid(spec: str) -> list[int]:
+    values = [value for value in parse_optional_int_grid(spec) if value is not None]
+    if not values:
+        raise ValueError(f"Empty integer grid: {spec!r}")
+    return values
+
+
+def parse_float_grid(spec: str) -> list[float]:
+    values: list[float] = []
+    for raw_value in spec.split(","):
+        value = raw_value.strip()
+        if value:
+            values.append(float(value))
+    if not values:
+        raise ValueError(f"Empty float grid: {spec!r}")
+    return values
+
+
+def parse_class_weight_grid(spec: str) -> list[str | None]:
+    values: list[str | None] = []
+    for raw_value in spec.split(","):
+        value = raw_value.strip().lower()
+        if not value:
+            continue
+        if value in {"none", "null"}:
+            values.append(None)
+        elif value == "balanced":
+            values.append("balanced")
+        else:
+            raise ValueError(f"Unsupported class_weight value: {raw_value!r}")
+    if not values:
+        raise ValueError(f"Empty class weight grid: {spec!r}")
+    return values
+
+
+def make_greedy_tree(
+    *,
+    params: dict[str, Any],
+    random_state: int,
+) -> DecisionTreeClassifier:
+    return DecisionTreeClassifier(
+        max_depth=params["max_depth"],
+        min_samples_leaf=params["min_samples_leaf"],
+        min_samples_split=params["min_samples_split"],
+        ccp_alpha=params["ccp_alpha"],
+        class_weight=params["class_weight"],
+        random_state=random_state,
+    )
+
+
+def iter_grid_params(
+    *,
+    max_depths: list[int | None],
+    min_samples_leaf_values: list[int],
+    min_samples_split_values: list[int],
+    ccp_alphas: list[float],
+    class_weights: list[str | None],
+) -> Iterable[dict[str, Any]]:
+    for max_depth in max_depths:
+        for min_samples_leaf in min_samples_leaf_values:
+            for min_samples_split in min_samples_split_values:
+                if min_samples_split < 2 * min_samples_leaf:
+                    continue
+                for ccp_alpha in ccp_alphas:
+                    for class_weight in class_weights:
+                        yield {
+                            "max_depth": max_depth,
+                            "min_samples_leaf": min_samples_leaf,
+                            "min_samples_split": min_samples_split,
+                            "ccp_alpha": ccp_alpha,
+                            "class_weight": class_weight,
+                        }
+
+
+def prune_redundant_same_label_splits(estimator: DecisionTreeClassifier) -> int:
+    tree = estimator.tree_
+    children_left = tree.children_left
+    children_right = tree.children_right
+    feature = tree.feature
+    threshold = tree.threshold
+    values = tree.value
+    collapsed = 0
+
+    def node_label(node: int) -> int:
+        return int(np.argmax(values[node][0]))
+
+    def recurse(node: int) -> int | None:
+        nonlocal collapsed
+        left = int(children_left[node])
+        right = int(children_right[node])
+        if left == _tree.TREE_LEAF and right == _tree.TREE_LEAF:
+            return node_label(node)
+
+        left_label = recurse(left)
+        right_label = recurse(right)
+        if left_label is not None and left_label == right_label:
+            children_left[node] = _tree.TREE_LEAF
+            children_right[node] = _tree.TREE_LEAF
+            feature[node] = _tree.TREE_UNDEFINED
+            threshold[node] = _tree.TREE_UNDEFINED
+            collapsed += 1
+            return left_label
+        return None
+
+    if tree.node_count:
+        recurse(0)
+    return collapsed
+
+
+def count_reachable_splits(estimator: DecisionTreeClassifier) -> int:
+    tree = estimator.tree_
+
+    def recurse(node: int) -> int:
+        left = int(tree.children_left[node])
+        right = int(tree.children_right[node])
+        if left == _tree.TREE_LEAF and right == _tree.TREE_LEAF:
+            return 0
+        return 1 + recurse(left) + recurse(right)
+
+    return recurse(0) if tree.node_count else 0
+
+
+def count_redundant_same_label_splits(estimator: DecisionTreeClassifier) -> int:
+    tree = estimator.tree_
+    values = tree.value
+    redundant = 0
+
+    def node_label(node: int) -> int:
+        return int(np.argmax(values[node][0]))
+
+    def recurse(node: int) -> int | None:
+        nonlocal redundant
+        left = int(tree.children_left[node])
+        right = int(tree.children_right[node])
+        if left == _tree.TREE_LEAF and right == _tree.TREE_LEAF:
+            return node_label(node)
+        left_label = recurse(left)
+        right_label = recurse(right)
+        if left_label is not None and left_label == right_label:
+            redundant += 1
+            return left_label
+        return None
+
+    if tree.node_count:
+        recurse(0)
+    return redundant
+
+
 def train_decision_tree(
     data: pd.DataFrame,
     *,
@@ -476,6 +667,13 @@ def train_decision_tree(
     max_depth: int,
     min_samples_leaf: int,
     random_state: int,
+    trainer: str,
+    test_size: float,
+    grid_max_depths: list[int | None],
+    grid_min_samples_leaf: list[int],
+    grid_min_samples_split: list[int],
+    grid_ccp_alphas: list[float],
+    grid_class_weights: list[str | None],
 ) -> Pipeline:
     missing = [column for column in FEATURE_COLUMNS if column not in data.columns]
     if missing:
@@ -495,26 +693,148 @@ def train_decision_tree(
     x = training_data[FEATURE_COLUMNS]
     y = training_data["best_explainer"].astype(str)
 
-    numeric_transformer = Pipeline(
-        steps=[
-            ("imputer", SimpleImputer(strategy="median")),
-        ]
+    class_counts = y.value_counts()
+    can_split = (
+        len(training_data) >= 10 and len(class_counts) >= 2 and class_counts.min() >= 2
     )
-    categorical_transformer = Pipeline(
-        steps=[
-            ("imputer", SimpleImputer(strategy="most_frequent")),
-            ("onehot", make_one_hot_encoder()),
+
+    if trainer == "grid":
+        if can_split:
+            x_train, x_valid, y_train, y_valid = train_test_split(
+                x,
+                y,
+                test_size=test_size,
+                random_state=random_state,
+                stratify=y,
+            )
+        else:
+            x_train = x_valid = x
+            y_train = y_valid = y
+            print(
+                "Not enough class diversity for a stratified validation split; "
+                "grid scores are training scores."
+            )
+
+        best_score = -1.0
+        best_split_count: int | None = None
+        best_params: dict[str, Any] | None = None
+        best_validation_report = ""
+        tried = 0
+
+        for params in iter_grid_params(
+            max_depths=grid_max_depths,
+            min_samples_leaf_values=grid_min_samples_leaf,
+            min_samples_split_values=grid_min_samples_split,
+            ccp_alphas=grid_ccp_alphas,
+            class_weights=grid_class_weights,
+        ):
+            tried += 1
+            candidate = Pipeline(
+                steps=[
+                    ("preprocess", make_preprocessor()),
+                    (
+                        "tree",
+                        make_greedy_tree(params=params, random_state=random_state),
+                    ),
+                ]
+            )
+            candidate.fit(x_train, y_train)
+            predictions = candidate.predict(x_valid)
+            score = accuracy_score(y_valid, predictions)
+            split_count = count_reachable_splits(candidate.named_steps["tree"])
+            if (
+                score > best_score
+                or (
+                    np.isclose(score, best_score)
+                    and (
+                        best_split_count is None
+                        or split_count < best_split_count
+                    )
+                )
+            ):
+                best_score = float(score)
+                best_split_count = split_count
+                best_params = params
+                best_validation_report = classification_report(
+                    y_valid,
+                    predictions,
+                    labels=sorted(y.unique()),
+                    zero_division=0,
+                )
+
+        if best_params is None:
+            raise ValueError("No valid decision-tree hyperparameter combinations were produced.")
+
+        print(f"Grid search tried {tried} decision trees.")
+        print(f"Best validation accuracy: {best_score:.4f}")
+        print(f"Best hyperparameters: {best_params}")
+        print("Best validation report:")
+        print(best_validation_report)
+
+        pipeline = Pipeline(
+            steps=[
+                ("preprocess", make_preprocessor()),
+                (
+                    "tree",
+                    make_greedy_tree(params=best_params, random_state=random_state),
+                ),
+            ]
+        )
+        pipeline.fit(x, y)
+        tree = pipeline.named_steps["tree"]
+        split_count_before = count_reachable_splits(tree)
+        collapsed = prune_redundant_same_label_splits(tree)
+        split_count_after = count_reachable_splits(tree)
+        redundant_after = count_redundant_same_label_splits(tree)
+        if redundant_after:
+            raise RuntimeError(
+                "Redundant same-label splits remain after pruning: "
+                f"{redundant_after}"
+            )
+        train_predictions = pipeline.predict(x)
+        print("Full-data training report after pruning:")
+        print(
+            classification_report(
+                y,
+                train_predictions,
+                labels=sorted(y.unique()),
+                zero_division=0,
+            )
+        )
+        print(
+            "Pruned redundant same-label splits: "
+            f"{collapsed}; reachable splits {split_count_before} -> {split_count_after}; "
+            f"remaining redundant splits={redundant_after}"
+        )
+
+        tree_pdf.parent.mkdir(parents=True, exist_ok=True)
+        transformed_feature_names = [
+            clean_feature_name(name)
+            for name in pipeline.named_steps["preprocess"].get_feature_names_out()
         ]
-    )
-    preprocess = ColumnTransformer(
-        transformers=[
-            ("num", numeric_transformer, NUMERIC_FEATURES),
-            ("cat", categorical_transformer, CATEGORICAL_FEATURES),
-        ]
-    )
+        figure_width = max(16.0, 3.5 * ((best_params["max_depth"] or max_depth) + 1))
+        figure_height = max(8.0, 2.2 * ((best_params["max_depth"] or max_depth) + 1))
+        figure, axis = plt.subplots(figsize=(figure_width, figure_height))
+        plot_tree(
+            tree,
+            feature_names=transformed_feature_names,
+            class_names=[str(label) for label in tree.classes_],
+            filled=True,
+            rounded=True,
+            impurity=False,
+            proportion=True,
+            ax=axis,
+        )
+        figure.tight_layout()
+        figure.savefig(tree_pdf)
+        plt.close(figure)
+
+        save_trained_model(pipeline, model_output)
+        return pipeline
+
     pipeline = Pipeline(
         steps=[
-            ("preprocess", preprocess),
+            ("preprocess", make_preprocessor()),
             (
                 "tree",
                 DecisionTreeClassifier(
@@ -579,13 +899,7 @@ def train_decision_tree(
     figure.savefig(tree_pdf)
     plt.close(figure)
 
-    if model_output is not None:
-        if joblib is None:
-            print("joblib is not available; skipping model export.")
-        else:
-            model_output.parent.mkdir(parents=True, exist_ok=True)
-            joblib.dump(pipeline, model_output)
-
+    save_trained_model(pipeline, model_output)
     return pipeline
 
 
@@ -666,6 +980,51 @@ def parse_args() -> argparse.Namespace:
         help="Random seed for train/test splitting and tree training.",
     )
     parser.add_argument(
+        "--trainer",
+        choices=("grid", "greedy"),
+        default="grid",
+        help=(
+            "Tree trainer. grid searches sklearn trees and retrains the best "
+            "on all data; greedy uses one sklearn tree."
+        ),
+    )
+    parser.add_argument(
+        "--test-size",
+        type=float,
+        default=0.25,
+        help="Validation split fraction used by grid and greedy trainers.",
+    )
+    parser.add_argument(
+        "--grid-max-depths",
+        type=str,
+        default="1,2,3,4",
+        help="Comma-separated max_depth values for grid search. Use None for unlimited.",
+    )
+    parser.add_argument(
+        "--grid-min-samples-leaf",
+        type=str,
+        default="1,2,5,10",
+        help="Comma-separated min_samples_leaf values for grid search.",
+    )
+    parser.add_argument(
+        "--grid-min-samples-split",
+        type=str,
+        default="2,5,10,20",
+        help="Comma-separated min_samples_split values for grid search.",
+    )
+    parser.add_argument(
+        "--grid-ccp-alphas",
+        type=str,
+        default="0,0.0001,0.001,0.005,0.01",
+        help="Comma-separated ccp_alpha values for grid search.",
+    )
+    parser.add_argument(
+        "--grid-class-weights",
+        type=str,
+        default="none,balanced",
+        help="Comma-separated class_weight values for grid search: none,balanced.",
+    )
+    parser.add_argument(
         "--ranking-policy",
         choices=("success_then_time", "time_then_success"),
         default="success_then_time",
@@ -724,6 +1083,13 @@ def main() -> int:
         max_depth=args.max_depth,
         min_samples_leaf=args.min_samples_leaf,
         random_state=args.random_state,
+        trainer=args.trainer,
+        test_size=args.test_size,
+        grid_max_depths=parse_optional_int_grid(args.grid_max_depths),
+        grid_min_samples_leaf=parse_int_grid(args.grid_min_samples_leaf),
+        grid_min_samples_split=parse_int_grid(args.grid_min_samples_split),
+        grid_ccp_alphas=parse_float_grid(args.grid_ccp_alphas),
+        grid_class_weights=parse_class_weight_grid(args.grid_class_weights),
     )
     print(f"Saved decision-tree PDF to {args.tree_pdf}")
     if args.model_output is not None and joblib is not None:
