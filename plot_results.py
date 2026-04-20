@@ -13,7 +13,16 @@ from typing import Any
 
 import numpy as np
 
-from parameters import DATASETS, MAX_DEPTHS, MODELS, N_ESTIMATORS, TIMEOUT, VOTING
+from parameters import (
+    DATASETS,
+    MAX_DEPTHS,
+    MODELS,
+    N_ESTIMATORS,
+    TIMEOUT,
+    VOTING,
+    DEFAULT_MAX_DEPTH,
+    DEFAULT_N_ESTIMATORS,
+)
 
 
 _CACHE_DIR = Path(gettempdir()) / "oceanpy-plot-cache"
@@ -1222,7 +1231,7 @@ def generate_plots_for_dataset(
         dataset,
         model_type,
         fixed_parameter_name="max_depth",
-        preferred_value=7,
+        preferred_value=DEFAULT_MAX_DEPTH,
         varying_parameter_name="n_estimators",
         varying_values=N_ESTIMATORS,
         voting=normalized_voting,
@@ -1231,7 +1240,7 @@ def generate_plots_for_dataset(
         dataset,
         model_type,
         fixed_parameter_name="n_estimators",
-        preferred_value=100,
+        preferred_value=DEFAULT_N_ESTIMATORS,
         varying_parameter_name="max_depth",
         varying_values=MAX_DEPTHS,
         voting=normalized_voting,
