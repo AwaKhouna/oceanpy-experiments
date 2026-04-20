@@ -2,13 +2,15 @@
 from __future__ import annotations
 
 import json
-import os
+
+# import os
 import warnings
 from dataclasses import dataclass
 from functools import lru_cache
 from itertools import combinations
 from pathlib import Path
-from tempfile import gettempdir
+
+# from tempfile import gettempdir
 from typing import Any
 
 import numpy as np
@@ -25,12 +27,12 @@ from parameters import (
 )
 
 
-_CACHE_DIR = Path(gettempdir()) / "oceanpy-plot-cache"
-_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-(_CACHE_DIR / "matplotlib").mkdir(parents=True, exist_ok=True)
-(_CACHE_DIR / "xdg-cache").mkdir(parents=True, exist_ok=True)
-os.environ.setdefault("MPLCONFIGDIR", str(_CACHE_DIR / "matplotlib"))
-os.environ.setdefault("XDG_CACHE_HOME", str(_CACHE_DIR / "xdg-cache"))
+# _CACHE_DIR = Path(gettempdir()) / "oceanpy-plot-cache"
+# _CACHE_DIR.mkdir(parents=True, exist_ok=True)
+# (_CACHE_DIR / "matplotlib").mkdir(parents=True, exist_ok=True)
+# (_CACHE_DIR / "xdg-cache").mkdir(parents=True, exist_ok=True)
+# os.environ.setdefault("MPLCONFIGDIR", str(_CACHE_DIR / "matplotlib"))
+# os.environ.setdefault("XDG_CACHE_HOME", str(_CACHE_DIR / "xdg-cache"))
 
 
 import matplotlib
