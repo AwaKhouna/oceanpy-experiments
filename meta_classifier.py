@@ -9,8 +9,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
+import matplotlib
+
+matplotlib.use("Agg")
 import numpy as np
 import pandas as pd
+
+import matplotlib.pyplot as plt
+
 from sklearn.compose import ColumnTransformer
 from sklearn.impute import SimpleImputer
 from sklearn.metrics import accuracy_score, classification_report
@@ -28,12 +34,6 @@ try:
     from parameters import TIMEOUT
 except Exception:  # pragma: no cover - keeps the script usable outside the repo root.
     TIMEOUT = 900
-
-
-import matplotlib
-
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 
 
 METHODS = ("cp", "mip", "mace", "maxsat")
@@ -102,31 +102,6 @@ PRIORITY_FEATURE_NAMES = {
     "hard_voting_isolation",
     "voting_type_HARD",
     "voting_type_SOFT",
-}
-PLOT_FEATURE_LABELS = {
-    "n_features": "No. features",
-    "n_features_F": "Continuous features",
-    "n_features_B": "Binary features",
-    "n_features_E": "Encoded categorical features",
-    "n_features_D": "Discrete features",
-    "n_estimators": "No. trees",
-    "max_depth": "Max tree depth",
-    "time_limit": "Time limit (s)",
-    "norm": "Distance norm",
-    "isolation": "Isolation enabled",
-    "hard_voting": "Hard voting",
-    "hard_voting_isolation": "Hard voting with isolation",
-    "n_samples": "Query samples",
-    "total_tree_nodes": "Total tree nodes",
-    "mean_tree_nodes": "Mean tree nodes",
-    "max_tree_nodes": "Max tree nodes",
-    "total_split_levels": "Total split levels",
-    "mean_split_levels_per_feature": "Mean split depth per feature",
-    "max_split_levels_per_feature": "Max split depth per feature",
-    "model_type_rf": "Random forest",
-    "model_type_xgb": "XGBoost",
-    "voting_type_HARD": "Hard voting",
-    "voting_type_SOFT": "Soft voting",
 }
 PAPER_TREE_FONT_SIZE = 11
 PAPER_TREE_BOX_PAD = 0.48
@@ -754,11 +729,6 @@ def clean_feature_name(name: str) -> str:
     return name
 
 
-def display_feature_name(name: str) -> str:
-    cleaned = clean_feature_name(name)
-    return PLOT_FEATURE_LABELS.get(cleaned, cleaned.replace("_", " "))
-
-
 def make_one_hot_encoder() -> OneHotEncoder:
     try:
         return OneHotEncoder(handle_unknown="ignore", sparse_output=False)
@@ -1028,7 +998,7 @@ def priority_feature_importance(model: Pipeline) -> float:
     )
 
 
-def strip_internal_node_classes(
+def apply_leaf_class_labels(
     annotations: list[Any],
     estimator: DecisionTreeClassifier,
 ) -> None:
@@ -1036,13 +1006,14 @@ def strip_internal_node_classes(
     for annotation, node in zip(annotations, iter_reachable_tree_nodes(estimator)):
         left = int(tree.children_left[node])
         right = int(tree.children_right[node])
-        if left == _tree.TREE_LEAF and right == _tree.TREE_LEAF:
-            continue
         lines = [
             line
             for line in annotation.get_text().splitlines()
             if not line.startswith("class = ")
         ]
+        if left == _tree.TREE_LEAF and right == _tree.TREE_LEAF:
+            class_index = int(np.argmax(tree.value[node][0]))
+            lines.append(f"class = {estimator.classes_[class_index]}")
         annotation.set_text("\n".join(lines))
 
 
@@ -1069,7 +1040,7 @@ def save_tree_plot(
     tree_pdf.parent.mkdir(parents=True, exist_ok=True)
     tree = pipeline.named_steps["tree"]
     transformed_feature_names = [
-        display_feature_name(name)
+        clean_feature_name(name)
         for name in pipeline.named_steps["preprocess"].get_feature_names_out()
     ]
     depth = reachable_tree_depth(tree)
@@ -1091,7 +1062,7 @@ def save_tree_plot(
             fontsize=PAPER_TREE_FONT_SIZE,
             ax=axis,
         )
-        strip_internal_node_classes(annotations, tree)
+        apply_leaf_class_labels(annotations, tree)
         style_tree_annotations(annotations)
         axis.margins(x=0.05, y=0.05)
         figure.subplots_adjust(left=0.01, right=0.99, top=0.98, bottom=0.02)
