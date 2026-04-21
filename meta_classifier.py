@@ -7,7 +7,15 @@ import os
 import random
 from dataclasses import dataclass
 from pathlib import Path
+from tempfile import gettempdir
 from typing import Any, Iterable
+
+_CACHE_DIR = Path(gettempdir()) / "oceanpy-meta-classifier-cache"
+_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+(_CACHE_DIR / "matplotlib").mkdir(parents=True, exist_ok=True)
+(_CACHE_DIR / "xdg-cache").mkdir(parents=True, exist_ok=True)
+os.environ.setdefault("MPLCONFIGDIR", str(_CACHE_DIR / "matplotlib"))
+os.environ.setdefault("XDG_CACHE_HOME", str(_CACHE_DIR / "xdg-cache"))
 
 import matplotlib
 
@@ -937,24 +945,6 @@ def count_redundant_same_label_splits(estimator: DecisionTreeClassifier) -> int:
     return redundant
 
 
-def iter_reachable_tree_nodes(estimator: DecisionTreeClassifier) -> list[int]:
-    tree = estimator.tree_
-    nodes: list[int] = []
-
-    def recurse(node: int) -> None:
-        nodes.append(node)
-        left = int(tree.children_left[node])
-        right = int(tree.children_right[node])
-        if left != _tree.TREE_LEAF:
-            recurse(left)
-        if right != _tree.TREE_LEAF:
-            recurse(right)
-
-    if tree.node_count:
-        recurse(0)
-    return nodes
-
-
 def count_reachable_leaves(estimator: DecisionTreeClassifier) -> int:
     tree = estimator.tree_
 
@@ -998,23 +988,26 @@ def priority_feature_importance(model: Pipeline) -> float:
     )
 
 
-def apply_leaf_class_labels(
-    annotations: list[Any],
-    estimator: DecisionTreeClassifier,
-) -> None:
-    tree = estimator.tree_
-    for annotation, node in zip(annotations, iter_reachable_tree_nodes(estimator)):
-        left = int(tree.children_left[node])
-        right = int(tree.children_right[node])
-        lines = [
-            line
-            for line in annotation.get_text().splitlines()
-            if not line.startswith("class = ")
+def keep_leaf_class_labels_only(annotations: list[Any]) -> None:
+    for annotation in annotations:
+        text = annotation.get_text()
+        lines = text.splitlines()
+        if not lines:
+            continue
+
+        is_tree_node = any(line.startswith("samples = ") for line in lines)
+        if not is_tree_node:
+            continue
+
+        class_lines = [line for line in lines if line.startswith("class = ")]
+        lines_without_class = [
+            line for line in lines if not line.startswith("class = ")
         ]
-        if left == _tree.TREE_LEAF and right == _tree.TREE_LEAF:
-            class_index = int(np.argmax(tree.value[node][0]))
-            lines.append(f"class = {estimator.classes_[class_index]}")
-        annotation.set_text("\n".join(lines))
+        # Do not rely on sklearn's returned artist order; it varies by version.
+        is_split_node = "<=" in lines_without_class[0]
+        if class_lines and not is_split_node:
+            lines_without_class.append(class_lines[-1])
+        annotation.set_text("\n".join(lines_without_class))
 
 
 def style_tree_annotations(annotations: list[Any]) -> None:
@@ -1062,7 +1055,7 @@ def save_tree_plot(
             fontsize=PAPER_TREE_FONT_SIZE,
             ax=axis,
         )
-        apply_leaf_class_labels(annotations, tree)
+        keep_leaf_class_labels_only(annotations)
         style_tree_annotations(annotations)
         axis.margins(x=0.05, y=0.05)
         figure.subplots_adjust(left=0.01, right=0.99, top=0.98, bottom=0.02)
