@@ -87,6 +87,33 @@ PRIORITY_FEATURE_NAMES = {
     "voting_type_HARD",
     "voting_type_SOFT",
 }
+PLOT_FEATURE_LABELS = {
+    "n_features": "No. features",
+    "n_features_F": "Continuous features",
+    "n_features_B": "Binary features",
+    "n_features_E": "Encoded categorical features",
+    "n_features_D": "Discrete features",
+    "n_estimators": "No. trees",
+    "max_depth": "Max tree depth",
+    "time_limit": "Time limit (s)",
+    "norm": "Distance norm",
+    "isolation": "Isolation enabled",
+    "hard_voting": "Hard voting",
+    "hard_voting_isolation": "Hard voting with isolation",
+    "n_samples": "Query samples",
+    "total_tree_nodes": "Total tree nodes",
+    "mean_tree_nodes": "Mean tree nodes",
+    "max_tree_nodes": "Max tree nodes",
+    "total_split_levels": "Total split levels",
+    "mean_split_levels_per_feature": "Mean split depth per feature",
+    "max_split_levels_per_feature": "Max split depth per feature",
+    "model_type_rf": "Random forest",
+    "model_type_xgb": "XGBoost",
+    "voting_type_HARD": "Hard voting",
+    "voting_type_SOFT": "Soft voting",
+}
+PAPER_TREE_FONT_SIZE = 11
+PAPER_TREE_BOX_PAD = 0.48
 
 
 @dataclass(frozen=True)
@@ -707,6 +734,11 @@ def clean_feature_name(name: str) -> str:
     return name
 
 
+def display_feature_name(name: str) -> str:
+    cleaned = clean_feature_name(name)
+    return PLOT_FEATURE_LABELS.get(cleaned, cleaned.replace("_", " "))
+
+
 def make_one_hot_encoder() -> OneHotEncoder:
     try:
         return OneHotEncoder(handle_unknown="ignore", sparse_output=False)
@@ -967,6 +999,50 @@ def count_redundant_same_label_splits(estimator: DecisionTreeClassifier) -> int:
     return redundant
 
 
+def iter_reachable_tree_nodes(estimator: DecisionTreeClassifier) -> list[int]:
+    tree = estimator.tree_
+    nodes: list[int] = []
+
+    def recurse(node: int) -> None:
+        nodes.append(node)
+        left = int(tree.children_left[node])
+        right = int(tree.children_right[node])
+        if left != _tree.TREE_LEAF:
+            recurse(left)
+        if right != _tree.TREE_LEAF:
+            recurse(right)
+
+    if tree.node_count:
+        recurse(0)
+    return nodes
+
+
+def count_reachable_leaves(estimator: DecisionTreeClassifier) -> int:
+    tree = estimator.tree_
+
+    def recurse(node: int) -> int:
+        left = int(tree.children_left[node])
+        right = int(tree.children_right[node])
+        if left == _tree.TREE_LEAF and right == _tree.TREE_LEAF:
+            return 1
+        return recurse(left) + recurse(right)
+
+    return recurse(0) if tree.node_count else 0
+
+
+def reachable_tree_depth(estimator: DecisionTreeClassifier) -> int:
+    tree = estimator.tree_
+
+    def recurse(node: int) -> int:
+        left = int(tree.children_left[node])
+        right = int(tree.children_right[node])
+        if left == _tree.TREE_LEAF and right == _tree.TREE_LEAF:
+            return 0
+        return 1 + max(recurse(left), recurse(right))
+
+    return recurse(0) if tree.node_count else 0
+
+
 def priority_feature_importance(model: Pipeline) -> float:
     feature_names = [
         clean_feature_name(name)
@@ -982,6 +1058,77 @@ def priority_feature_importance(model: Pipeline) -> float:
             ]
         )
     )
+
+
+def strip_internal_node_classes(
+    annotations: list[Any],
+    estimator: DecisionTreeClassifier,
+) -> None:
+    tree = estimator.tree_
+    for annotation, node in zip(annotations, iter_reachable_tree_nodes(estimator)):
+        left = int(tree.children_left[node])
+        right = int(tree.children_right[node])
+        if left == _tree.TREE_LEAF and right == _tree.TREE_LEAF:
+            continue
+        lines = [
+            line
+            for line in annotation.get_text().splitlines()
+            if not line.startswith("class = ")
+        ]
+        annotation.set_text("\n".join(lines))
+
+
+def style_tree_annotations(annotations: list[Any]) -> None:
+    for annotation in annotations:
+        annotation.set_fontsize(PAPER_TREE_FONT_SIZE)
+        annotation.set_linespacing(1.2)
+        box = annotation.get_bbox_patch()
+        if box is not None:
+            box.set_boxstyle(f"round,pad={PAPER_TREE_BOX_PAD}")
+            box.set_linewidth(0.9)
+            box.set_edgecolor("#404040")
+        arrow = getattr(annotation, "arrow_patch", None)
+        if arrow is not None:
+            arrow.set_linewidth(0.8)
+            arrow.set_color("#404040")
+
+
+def save_tree_plot(
+    pipeline: Pipeline,
+    *,
+    tree_pdf: Path,
+) -> None:
+    tree_pdf.parent.mkdir(parents=True, exist_ok=True)
+    tree = pipeline.named_steps["tree"]
+    transformed_feature_names = [
+        display_feature_name(name)
+        for name in pipeline.named_steps["preprocess"].get_feature_names_out()
+    ]
+    depth = reachable_tree_depth(tree)
+    leaf_count = count_reachable_leaves(tree)
+    figure_width = max(18.0, min(30.0, 2.9 * leaf_count + 5.5))
+    figure_height = max(4.2, min(6.6, 1.15 * (depth + 1)))
+
+    with plt.rc_context({"pdf.fonttype": 42, "ps.fonttype": 42}):
+        figure, axis = plt.subplots(figsize=(figure_width, figure_height))
+        annotations = plot_tree(
+            tree,
+            feature_names=transformed_feature_names,
+            class_names=[str(label) for label in tree.classes_],
+            filled=True,
+            rounded=True,
+            impurity=False,
+            proportion=True,
+            precision=2,
+            fontsize=PAPER_TREE_FONT_SIZE,
+            ax=axis,
+        )
+        strip_internal_node_classes(annotations, tree)
+        style_tree_annotations(annotations)
+        axis.margins(x=0.05, y=0.05)
+        figure.subplots_adjust(left=0.01, right=0.99, top=0.98, bottom=0.02)
+        figure.savefig(tree_pdf, bbox_inches="tight", pad_inches=0.03)
+        plt.close(figure)
 
 
 def train_decision_tree(
@@ -1164,28 +1311,7 @@ def train_decision_tree(
             f"remaining redundant splits={redundant_after}"
         )
 
-        tree_pdf.parent.mkdir(parents=True, exist_ok=True)
-        transformed_feature_names = [
-            clean_feature_name(name)
-            for name in pipeline.named_steps["preprocess"].get_feature_names_out()
-        ]
-        figure_width = max(16.0, 3.5 * ((best_params["max_depth"] or max_depth) + 1))
-        figure_height = max(8.0, 2.2 * ((best_params["max_depth"] or max_depth) + 1))
-        figure, axis = plt.subplots(figsize=(figure_width, figure_height))
-        plot_tree(
-            tree,
-            feature_names=transformed_feature_names,
-            class_names=[str(label) for label in tree.classes_],
-            filled=True,
-            rounded=True,
-            impurity=False,
-            proportion=True,
-            ax=axis,
-        )
-        figure.tight_layout()
-        figure.savefig(tree_pdf)
-        plt.close(figure)
-
+        save_tree_plot(pipeline, tree_pdf=tree_pdf)
         save_trained_model(pipeline, model_output)
         return pipeline
 
@@ -1235,29 +1361,7 @@ def train_decision_tree(
             "Not enough class diversity for a stratified validation split; fitted on all rows."
         )
 
-    tree_pdf.parent.mkdir(parents=True, exist_ok=True)
-    transformed_feature_names = [
-        clean_feature_name(name)
-        for name in pipeline.named_steps["preprocess"].get_feature_names_out()
-    ]
-    tree = pipeline.named_steps["tree"]
-    figure_width = max(16.0, 3.5 * (max_depth + 1))
-    figure_height = max(8.0, 2.2 * (max_depth + 1))
-    figure, axis = plt.subplots(figsize=(figure_width, figure_height))
-    plot_tree(
-        tree,
-        feature_names=transformed_feature_names,
-        class_names=[str(label) for label in tree.classes_],
-        filled=True,
-        rounded=True,
-        impurity=False,
-        proportion=True,
-        ax=axis,
-    )
-    figure.tight_layout()
-    figure.savefig(tree_pdf)
-    plt.close(figure)
-
+    save_tree_plot(pipeline, tree_pdf=tree_pdf)
     save_trained_model(pipeline, model_output)
     return pipeline
 
