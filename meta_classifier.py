@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-import argparse
 import json
 import math
 import os
+import random
 from dataclasses import dataclass
 from pathlib import Path
-from tempfile import gettempdir
 from typing import Any, Iterable
 
 import numpy as np
@@ -31,13 +30,6 @@ except Exception:  # pragma: no cover - keeps the script usable outside the repo
     TIMEOUT = 900
 
 
-_CACHE_DIR = Path(gettempdir()) / "oceanpy-meta-classifier-cache"
-_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-(_CACHE_DIR / "matplotlib").mkdir(parents=True, exist_ok=True)
-(_CACHE_DIR / "xdg-cache").mkdir(parents=True, exist_ok=True)
-os.environ.setdefault("MPLCONFIGDIR", str(_CACHE_DIR / "matplotlib"))
-os.environ.setdefault("XDG_CACHE_HOME", str(_CACHE_DIR / "xdg-cache"))
-
 import matplotlib
 
 matplotlib.use("Agg")
@@ -55,7 +47,32 @@ DATASET_ALIASES = {
     "Breast-Cancer-Wisconsin": "BreastCancerWisconsin",
     "Credit": "GermanCredit",
 }
-BASE_NUMERIC_FEATURES = [
+
+# Main run configuration. Edit these values instead of passing CLI arguments.
+RESULTS_DIR = Path("results")
+DATASETS_DIR = Path("datasets")
+OUTPUT_CSV = Path("results/meta_classifier_training_data.csv")
+TREE_PDF = Path("plots/meta_classifier_decision_tree.pdf")
+MODEL_OUTPUT = Path("results/meta_classifier_decision_tree.joblib")
+
+TRAIN_ONLY = False
+COLLECT_ONLY = False
+REQUIRE_OPTIMAL = True
+RANKING_POLICY = "success_then_time"
+RANKING_POLICIES = {"success_then_time", "time_then_success"}
+
+RANDOM_SEED = 0
+TEST_SIZE = 0.25
+HARD_VOTING_SAMPLE_WEIGHT = 2.0
+ISOLATION_SAMPLE_WEIGHT = 2.0
+
+GRID_MAX_DEPTHS = [1, 2, 3, 4]
+GRID_MIN_SAMPLES_LEAF = [1, 2, 5, 10]
+GRID_MIN_SAMPLES_SPLIT = [2, 5, 10, 20]
+GRID_CCP_ALPHAS = [0.0, 0.0001, 0.001, 0.005, 0.01]
+GRID_CLASS_WEIGHTS = [None, "balanced"]
+
+NUMERIC_FEATURES = [
     "n_features",
     "n_features_F",
     "n_features_B",
@@ -76,7 +93,6 @@ BASE_NUMERIC_FEATURES = [
     "mean_split_levels_per_feature",
     "max_split_levels_per_feature",
 ]
-NUMERIC_FEATURES = BASE_NUMERIC_FEATURES
 CATEGORICAL_FEATURES = ["model_type", "voting_type"]
 FEATURE_COLUMNS = NUMERIC_FEATURES + CATEGORICAL_FEATURES
 CSV_COLUMNS = ["dataset", "best_explainer"] + FEATURE_COLUMNS
@@ -143,6 +159,12 @@ def finite_float(value: Any) -> float | None:
     if not np.isfinite(result):
         return None
     return result
+
+
+def set_reproducibility_seed(seed: int) -> None:
+    os.environ.setdefault("PYTHONHASHSEED", str(seed))
+    random.seed(seed)
+    np.random.seed(seed)
 
 
 def finite_nonnegative_float(value: Any) -> float | None:
@@ -354,9 +376,7 @@ def summarize_prefixed_method(
     for explanation in explanations:
         if not isinstance(explanation, dict):
             continue
-        time_value = finite_nonnegative_float(
-            explanation.get(f"{metric_prefix}_time")
-        )
+        time_value = finite_nonnegative_float(explanation.get(f"{metric_prefix}_time"))
         method_was_attempted = (
             time_value is not None or f"{metric_prefix}_status" in explanation
         )
@@ -817,9 +837,7 @@ def priority_sample_weights(
         .to_numpy()
     )
     isolation = (
-        pd.to_numeric(training_data["isolation"], errors="coerce")
-        .fillna(0)
-        .to_numpy()
+        pd.to_numeric(training_data["isolation"], errors="coerce").fillna(0).to_numpy()
     )
     weights *= np.where(hard_voting >= 0.5, hard_voting_sample_weight, 1.0)
     weights *= np.where(isolation >= 0.5, isolation_sample_weight, 1.0)
@@ -836,57 +854,7 @@ def save_trained_model(model: Pipeline, model_output: Path | None) -> None:
     joblib.dump(model, model_output)
 
 
-def parse_optional_int_grid(spec: str) -> list[int | None]:
-    values: list[int | None] = []
-    for raw_value in spec.split(","):
-        value = raw_value.strip()
-        if not value:
-            continue
-        if value.lower() in {"none", "null"}:
-            values.append(None)
-        else:
-            values.append(int(value))
-    if not values:
-        raise ValueError(f"Empty integer grid: {spec!r}")
-    return values
-
-
-def parse_int_grid(spec: str) -> list[int]:
-    values = [value for value in parse_optional_int_grid(spec) if value is not None]
-    if not values:
-        raise ValueError(f"Empty integer grid: {spec!r}")
-    return values
-
-
-def parse_float_grid(spec: str) -> list[float]:
-    values: list[float] = []
-    for raw_value in spec.split(","):
-        value = raw_value.strip()
-        if value:
-            values.append(float(value))
-    if not values:
-        raise ValueError(f"Empty float grid: {spec!r}")
-    return values
-
-
-def parse_class_weight_grid(spec: str) -> list[str | None]:
-    values: list[str | None] = []
-    for raw_value in spec.split(","):
-        value = raw_value.strip().lower()
-        if not value:
-            continue
-        if value in {"none", "null"}:
-            values.append(None)
-        elif value == "balanced":
-            values.append("balanced")
-        else:
-            raise ValueError(f"Unsupported class_weight value: {raw_value!r}")
-    if not values:
-        raise ValueError(f"Empty class weight grid: {spec!r}")
-    return values
-
-
-def make_greedy_tree(
+def make_decision_tree(
     *,
     params: dict[str, Any],
     random_state: int,
@@ -1136,10 +1104,7 @@ def train_decision_tree(
     *,
     tree_pdf: Path,
     model_output: Path | None,
-    max_depth: int,
-    min_samples_leaf: int,
     random_state: int,
-    trainer: str,
     test_size: float,
     grid_max_depths: list[int | None],
     grid_min_samples_leaf: list[int],
@@ -1185,181 +1150,125 @@ def train_decision_tree(
         len(training_data) >= 10 and len(class_counts) >= 2 and class_counts.min() >= 2
     )
 
-    if trainer == "grid":
-        if can_split:
-            x_train, x_valid, y_train, y_valid, w_train, w_valid = train_test_split(
-                x,
-                y,
-                sample_weights,
-                test_size=test_size,
-                random_state=random_state,
-                stratify=y,
-            )
-        else:
-            x_train = x_valid = x
-            y_train = y_valid = y
-            w_train = w_valid = sample_weights
-            print(
-                "Not enough class diversity for a stratified validation split; "
-                "grid scores are training scores."
-            )
+    if can_split:
+        x_train, x_valid, y_train, y_valid, w_train, w_valid = train_test_split(
+            x,
+            y,
+            sample_weights,
+            test_size=test_size,
+            random_state=random_state,
+            stratify=y,
+        )
+    else:
+        x_train = x_valid = x
+        y_train = y_valid = y
+        w_train = w_valid = sample_weights
+        print(
+            "Not enough class diversity for a stratified validation split; "
+            "grid scores are training scores."
+        )
 
-        best_score = -1.0
-        best_split_count: int | None = None
-        best_priority_importance = -1.0
-        best_params: dict[str, Any] | None = None
-        best_validation_report = ""
-        tried = 0
+    best_score = -1.0
+    best_split_count: int | None = None
+    best_priority_importance = -1.0
+    best_params: dict[str, Any] | None = None
+    best_validation_report = ""
+    tried = 0
 
-        for params in iter_grid_params(
-            max_depths=grid_max_depths,
-            min_samples_leaf_values=grid_min_samples_leaf,
-            min_samples_split_values=grid_min_samples_split,
-            ccp_alphas=grid_ccp_alphas,
-            class_weights=grid_class_weights,
-        ):
-            tried += 1
-            candidate = Pipeline(
-                steps=[
-                    ("preprocess", make_preprocessor()),
-                    (
-                        "tree",
-                        make_greedy_tree(params=params, random_state=random_state),
-                    ),
-                ]
-            )
-            candidate.fit(x_train, y_train, tree__sample_weight=w_train)
-            predictions = candidate.predict(x_valid)
-            score = accuracy_score(y_valid, predictions, sample_weight=w_valid)
-            split_count = count_reachable_splits(candidate.named_steps["tree"])
-            candidate_priority_importance = priority_feature_importance(candidate)
-            if (
-                score > best_score
-                or (
-                    np.isclose(score, best_score)
-                    and (
-                        candidate_priority_importance > best_priority_importance
-                        or (
-                            np.isclose(
-                                candidate_priority_importance,
-                                best_priority_importance,
-                            )
-                            and (
-                                best_split_count is None
-                                or split_count < best_split_count
-                            )
-                        )
-                    )
-                )
-            ):
-                best_score = float(score)
-                best_split_count = split_count
-                best_priority_importance = candidate_priority_importance
-                best_params = params
-                best_validation_report = classification_report(
-                    y_valid,
-                    predictions,
-                    labels=sorted(y.unique()),
-                    sample_weight=w_valid,
-                    zero_division=0,
-                )
-
-        if best_params is None:
-            raise ValueError("No valid decision-tree hyperparameter combinations were produced.")
-
-        print(f"Grid search tried {tried} decision trees.")
-        print(f"Best validation accuracy: {best_score:.4f}")
-        print(f"Best priority feature importance: {best_priority_importance:.4f}")
-        print(f"Best hyperparameters: {best_params}")
-        print("Best validation report:")
-        print(best_validation_report)
-
-        pipeline = Pipeline(
+    for params in iter_grid_params(
+        max_depths=grid_max_depths,
+        min_samples_leaf_values=grid_min_samples_leaf,
+        min_samples_split_values=grid_min_samples_split,
+        ccp_alphas=grid_ccp_alphas,
+        class_weights=grid_class_weights,
+    ):
+        tried += 1
+        candidate = Pipeline(
             steps=[
                 ("preprocess", make_preprocessor()),
                 (
                     "tree",
-                    make_greedy_tree(params=best_params, random_state=random_state),
+                    make_decision_tree(params=params, random_state=random_state),
                 ),
             ]
         )
-        pipeline.fit(x, y, tree__sample_weight=sample_weights)
-        tree = pipeline.named_steps["tree"]
-        split_count_before = count_reachable_splits(tree)
-        collapsed = prune_redundant_same_label_splits(tree)
-        split_count_after = count_reachable_splits(tree)
-        redundant_after = count_redundant_same_label_splits(tree)
-        if redundant_after:
-            raise RuntimeError(
-                "Redundant same-label splits remain after pruning: "
-                f"{redundant_after}"
+        candidate.fit(x_train, y_train, tree__sample_weight=w_train)
+        predictions = candidate.predict(x_valid)
+        score = accuracy_score(y_valid, predictions, sample_weight=w_valid)
+        split_count = count_reachable_splits(candidate.named_steps["tree"])
+        candidate_priority_importance = priority_feature_importance(candidate)
+        if score > best_score or (
+            np.isclose(score, best_score)
+            and (
+                candidate_priority_importance > best_priority_importance
+                or (
+                    np.isclose(
+                        candidate_priority_importance,
+                        best_priority_importance,
+                    )
+                    and (best_split_count is None or split_count < best_split_count)
+                )
             )
-        train_predictions = pipeline.predict(x)
-        print("Full-data training report after pruning:")
-        print(
-            classification_report(
-                y,
-                train_predictions,
+        ):
+            best_score = float(score)
+            best_split_count = split_count
+            best_priority_importance = candidate_priority_importance
+            best_params = params
+            best_validation_report = classification_report(
+                y_valid,
+                predictions,
                 labels=sorted(y.unique()),
-                sample_weight=sample_weights,
+                sample_weight=w_valid,
                 zero_division=0,
             )
-        )
-        print(
-            "Pruned redundant same-label splits: "
-            f"{collapsed}; reachable splits {split_count_before} -> {split_count_after}; "
-            f"remaining redundant splits={redundant_after}"
+
+    if best_params is None:
+        raise ValueError(
+            "No valid decision-tree hyperparameter combinations were produced."
         )
 
-        save_tree_plot(pipeline, tree_pdf=tree_pdf)
-        save_trained_model(pipeline, model_output)
-        return pipeline
+    print(f"Grid search tried {tried} decision trees.")
+    print(f"Best validation accuracy: {best_score:.4f}")
+    print(f"Best priority feature importance: {best_priority_importance:.4f}")
+    print(f"Best hyperparameters: {best_params}")
+    print("Best validation report:")
+    print(best_validation_report)
 
     pipeline = Pipeline(
         steps=[
             ("preprocess", make_preprocessor()),
             (
                 "tree",
-                DecisionTreeClassifier(
-                    max_depth=max_depth,
-                    min_samples_leaf=min_samples_leaf,
-                    class_weight="balanced",
-                    random_state=random_state,
-                ),
+                make_decision_tree(params=best_params, random_state=random_state),
             ),
         ]
     )
-
-    class_counts = y.value_counts()
-    can_split = (
-        len(training_data) >= 10 and len(class_counts) >= 2 and class_counts.min() >= 2
-    )
-    if can_split:
-        x_train, x_test, y_train, y_test, w_train, w_test = train_test_split(
-            x,
+    pipeline.fit(x, y, tree__sample_weight=sample_weights)
+    tree = pipeline.named_steps["tree"]
+    split_count_before = count_reachable_splits(tree)
+    collapsed = prune_redundant_same_label_splits(tree)
+    split_count_after = count_reachable_splits(tree)
+    redundant_after = count_redundant_same_label_splits(tree)
+    if redundant_after:
+        raise RuntimeError(
+            f"Redundant same-label splits remain after pruning: {redundant_after}"
+        )
+    train_predictions = pipeline.predict(x)
+    print("Full-data training report after pruning:")
+    print(
+        classification_report(
             y,
-            sample_weights,
-            test_size=0.25,
-            random_state=random_state,
-            stratify=y,
+            train_predictions,
+            labels=sorted(y.unique()),
+            sample_weight=sample_weights,
+            zero_division=0,
         )
-        pipeline.fit(x_train, y_train, tree__sample_weight=w_train)
-        predictions = pipeline.predict(x_test)
-        print("Validation report:")
-        print(
-            classification_report(
-                y_test,
-                predictions,
-                labels=sorted(y.unique()),
-                sample_weight=w_test,
-                zero_division=0,
-            )
-        )
-    else:
-        pipeline.fit(x, y, tree__sample_weight=sample_weights)
-        print(
-            "Not enough class diversity for a stratified validation split; fitted on all rows."
-        )
+    )
+    print(
+        "Pruned redundant same-label splits: "
+        f"{collapsed}; reachable splits {split_count_before} -> {split_count_after}; "
+        f"remaining redundant splits={redundant_after}"
+    )
 
     save_tree_plot(pipeline, tree_pdf=tree_pdf)
     save_trained_model(pipeline, model_output)
@@ -1388,171 +1297,27 @@ def recommend_best_explainer(
     return labels[0] if len(labels) == 1 else labels
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description=(
-            "Collect experiment-result metadata and train a decision-tree "
-            "meta-classifier for the best counterfactual explainer."
-        )
-    )
-    parser.add_argument(
-        "--results-dir",
-        type=Path,
-        default=Path("results"),
-        help="Root directory containing experiment result JSON files.",
-    )
-    parser.add_argument(
-        "--datasets-dir",
-        type=Path,
-        default=Path("datasets"),
-        help="Directory containing dataset CSV files with two-line headers.",
-    )
-    parser.add_argument(
-        "--output-csv",
-        type=Path,
-        default=Path("results/meta_classifier_training_data.csv"),
-        help="Path where the collected meta-classifier CSV is written.",
-    )
-    parser.add_argument(
-        "--tree-pdf",
-        type=Path,
-        default=Path("plots/meta_classifier_decision_tree.pdf"),
-        help="Path where the decision-tree PDF is written.",
-    )
-    parser.add_argument(
-        "--model-output",
-        type=Path,
-        default=Path("results/meta_classifier_decision_tree.joblib"),
-        help="Optional path for the trained sklearn pipeline.",
-    )
-    parser.add_argument(
-        "--max-depth",
-        type=int,
-        default=4,
-        help="Maximum depth of the decision tree.",
-    )
-    parser.add_argument(
-        "--min-samples-leaf",
-        type=int,
-        default=5,
-        help="Minimum samples per decision-tree leaf.",
-    )
-    parser.add_argument(
-        "--random-state",
-        type=int,
-        default=0,
-        help="Random seed for train/test splitting and tree training.",
-    )
-    parser.add_argument(
-        "--trainer",
-        choices=("grid", "greedy"),
-        default="grid",
-        help=(
-            "Tree trainer. grid searches sklearn trees and retrains the best "
-            "on all data; greedy uses one sklearn tree."
-        ),
-    )
-    parser.add_argument(
-        "--test-size",
-        type=float,
-        default=0.25,
-        help="Validation split fraction used by grid and greedy trainers.",
-    )
-    parser.add_argument(
-        "--grid-max-depths",
-        type=str,
-        default="1,2,3,4",
-        help="Comma-separated max_depth values for grid search. Use None for unlimited.",
-    )
-    parser.add_argument(
-        "--grid-min-samples-leaf",
-        type=str,
-        default="1,2,5,10",
-        help="Comma-separated min_samples_leaf values for grid search.",
-    )
-    parser.add_argument(
-        "--grid-min-samples-split",
-        type=str,
-        default="2,5,10,20",
-        help="Comma-separated min_samples_split values for grid search.",
-    )
-    parser.add_argument(
-        "--grid-ccp-alphas",
-        type=str,
-        default="0,0.0001,0.001,0.005,0.01",
-        help="Comma-separated ccp_alpha values for grid search.",
-    )
-    parser.add_argument(
-        "--grid-class-weights",
-        type=str,
-        default="none,balanced",
-        help="Comma-separated class_weight values for grid search: none,balanced.",
-    )
-    parser.add_argument(
-        "--hard-voting-sample-weight",
-        type=float,
-        default=2.0,
-        help=(
-            "Sample-weight multiplier for rows using HARD voting. Values above "
-            "1 make HARD-voting configurations more important during training."
-        ),
-    )
-    parser.add_argument(
-        "--isolation-sample-weight",
-        type=float,
-        default=2.0,
-        help=(
-            "Sample-weight multiplier for rows using isolation. Values above "
-            "1 make isolation configurations more important during training."
-        ),
-    )
-    parser.add_argument(
-        "--ranking-policy",
-        choices=("success_then_time", "time_then_success"),
-        default="success_then_time",
-        help=(
-            "How to label the best explainer. success_then_time first keeps "
-            "only the best success-rate methods, then picks the lowest "
-            "amortized time."
-        ),
-    )
-    parser.add_argument(
-        "--allow-non-optimal",
-        action="store_true",
-        help="Treat valid non-OPTIMAL counterfactuals as successful.",
-    )
-    parser.add_argument(
-        "--collect-only",
-        action="store_true",
-        help="Only collect and save the CSV; do not train or plot the tree.",
-    )
-    parser.add_argument(
-        "--train-only",
-        action="store_true",
-        help="Train from an existing CSV without recollecting result JSON files.",
-    )
-    return parser.parse_args()
-
-
 def main() -> int:
-    args = parse_args()
-    if args.collect_only and args.train_only:
-        raise ValueError("--collect-only and --train-only cannot be used together.")
+    set_reproducibility_seed(RANDOM_SEED)
+    if COLLECT_ONLY and TRAIN_ONLY:
+        raise ValueError("COLLECT_ONLY and TRAIN_ONLY cannot both be True.")
+    if RANKING_POLICY not in RANKING_POLICIES:
+        raise ValueError(f"Unsupported RANKING_POLICY: {RANKING_POLICY!r}")
 
-    if args.train_only:
-        data = pd.read_csv(args.output_csv)
+    if TRAIN_ONLY:
+        data = pd.read_csv(OUTPUT_CSV)
     else:
         data = collect_training_data(
-            results_dir=args.results_dir,
-            datasets_dir=args.datasets_dir,
-            require_optimal=not args.allow_non_optimal,
-            ranking_policy=args.ranking_policy,
+            results_dir=RESULTS_DIR,
+            datasets_dir=DATASETS_DIR,
+            require_optimal=REQUIRE_OPTIMAL,
+            ranking_policy=RANKING_POLICY,
         )
-        args.output_csv.parent.mkdir(parents=True, exist_ok=True)
-        data.to_csv(args.output_csv, index=False)
-        print(f"Saved {len(data)} configuration rows to {args.output_csv}")
+        OUTPUT_CSV.parent.mkdir(parents=True, exist_ok=True)
+        data.to_csv(OUTPUT_CSV, index=False)
+        print(f"Saved {len(data)} configuration rows to {OUTPUT_CSV}")
 
-    if args.collect_only:
+    if COLLECT_ONLY:
         return 0
 
     if data.empty:
@@ -1560,24 +1325,21 @@ def main() -> int:
 
     train_decision_tree(
         data,
-        tree_pdf=args.tree_pdf,
-        model_output=args.model_output,
-        max_depth=args.max_depth,
-        min_samples_leaf=args.min_samples_leaf,
-        random_state=args.random_state,
-        trainer=args.trainer,
-        test_size=args.test_size,
-        grid_max_depths=parse_optional_int_grid(args.grid_max_depths),
-        grid_min_samples_leaf=parse_int_grid(args.grid_min_samples_leaf),
-        grid_min_samples_split=parse_int_grid(args.grid_min_samples_split),
-        grid_ccp_alphas=parse_float_grid(args.grid_ccp_alphas),
-        grid_class_weights=parse_class_weight_grid(args.grid_class_weights),
-        hard_voting_sample_weight=args.hard_voting_sample_weight,
-        isolation_sample_weight=args.isolation_sample_weight,
+        tree_pdf=TREE_PDF,
+        model_output=MODEL_OUTPUT,
+        random_state=RANDOM_SEED,
+        test_size=TEST_SIZE,
+        grid_max_depths=GRID_MAX_DEPTHS,
+        grid_min_samples_leaf=GRID_MIN_SAMPLES_LEAF,
+        grid_min_samples_split=GRID_MIN_SAMPLES_SPLIT,
+        grid_ccp_alphas=GRID_CCP_ALPHAS,
+        grid_class_weights=GRID_CLASS_WEIGHTS,
+        hard_voting_sample_weight=HARD_VOTING_SAMPLE_WEIGHT,
+        isolation_sample_weight=ISOLATION_SAMPLE_WEIGHT,
     )
-    print(f"Saved decision-tree PDF to {args.tree_pdf}")
-    if args.model_output is not None and joblib is not None:
-        print(f"Saved trained sklearn pipeline to {args.model_output}")
+    print(f"Saved decision-tree PDF to {TREE_PDF}")
+    if MODEL_OUTPUT is not None and joblib is not None:
+        print(f"Saved trained sklearn pipeline to {MODEL_OUTPUT}")
     return 0
 
 
