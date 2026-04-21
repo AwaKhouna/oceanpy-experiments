@@ -66,6 +66,8 @@ BASE_NUMERIC_FEATURES = [
     "time_limit",
     "norm",
     "isolation",
+    "hard_voting",
+    "hard_voting_isolation",
     "n_samples",
     "total_tree_nodes",
     "mean_tree_nodes",
@@ -78,6 +80,13 @@ NUMERIC_FEATURES = BASE_NUMERIC_FEATURES
 CATEGORICAL_FEATURES = ["model_type", "voting_type"]
 FEATURE_COLUMNS = NUMERIC_FEATURES + CATEGORICAL_FEATURES
 CSV_COLUMNS = ["dataset", "best_explainer"] + FEATURE_COLUMNS
+PRIORITY_FEATURE_NAMES = {
+    "isolation",
+    "hard_voting",
+    "hard_voting_isolation",
+    "voting_type_HARD",
+    "voting_type_SOFT",
+}
 
 
 @dataclass(frozen=True)
@@ -224,6 +233,12 @@ def infer_voting_type(path: Path, entry: dict[str, Any], model_type: str) -> str
     if model_type == "rf" and path.stem.endswith("_HARD"):
         return "HARD"
     return "SOFT"
+
+
+def infer_hard_voting(voting_type: Any) -> int:
+    if not isinstance(voting_type, str):
+        return 0
+    return int(voting_type.strip().upper() == "HARD")
 
 
 def is_supported_result_file(path: Path) -> bool:
@@ -435,6 +450,7 @@ def row_from_summaries(
 
     model_type = infer_model_type(path, entry)
     voting_type = infer_voting_type(path, entry, model_type)
+    hard_voting = infer_hard_voting(voting_type)
 
     time_limit = finite_nonnegative_float(entry.get("timeout"))
     if time_limit is None:
@@ -456,6 +472,8 @@ def row_from_summaries(
         "time_limit": time_limit,
         "norm": norm,
         "isolation": isolation,
+        "hard_voting": hard_voting,
+        "hard_voting_isolation": hard_voting * isolation,
         "n_samples": n_samples,
         **type_counts,
         **model_complexity_features(entry),
@@ -716,6 +734,66 @@ def make_preprocessor() -> ColumnTransformer:
     )
 
 
+def add_engineered_feature_columns(data: pd.DataFrame) -> pd.DataFrame:
+    data = data.copy()
+
+    if "hard_voting" in data.columns:
+        hard_voting = pd.to_numeric(data["hard_voting"], errors="coerce")
+    else:
+        hard_voting = pd.Series(np.nan, index=data.index, dtype=float)
+
+    if "voting_type" in data.columns:
+        inferred_hard_voting = (
+            data["voting_type"]
+            .fillna("")
+            .astype(str)
+            .str.strip()
+            .str.upper()
+            .eq("HARD")
+            .astype(int)
+        )
+        hard_voting = hard_voting.fillna(inferred_hard_voting)
+
+    data["hard_voting"] = hard_voting
+
+    isolation = (
+        pd.to_numeric(data["isolation"], errors="coerce")
+        if "isolation" in data.columns
+        else pd.Series(np.nan, index=data.index, dtype=float)
+    )
+    data["hard_voting_isolation"] = hard_voting * isolation
+    return data
+
+
+def priority_sample_weights(
+    training_data: pd.DataFrame,
+    *,
+    hard_voting_sample_weight: float,
+    isolation_sample_weight: float,
+) -> np.ndarray:
+    for name, value in {
+        "hard_voting_sample_weight": hard_voting_sample_weight,
+        "isolation_sample_weight": isolation_sample_weight,
+    }.items():
+        if not np.isfinite(value) or value <= 0:
+            raise ValueError(f"{name} must be a positive finite value.")
+
+    weights = np.ones(len(training_data), dtype=float)
+    hard_voting = (
+        pd.to_numeric(training_data["hard_voting"], errors="coerce")
+        .fillna(0)
+        .to_numpy()
+    )
+    isolation = (
+        pd.to_numeric(training_data["isolation"], errors="coerce")
+        .fillna(0)
+        .to_numpy()
+    )
+    weights *= np.where(hard_voting >= 0.5, hard_voting_sample_weight, 1.0)
+    weights *= np.where(isolation >= 0.5, isolation_sample_weight, 1.0)
+    return weights
+
+
 def save_trained_model(model: Pipeline, model_output: Path | None) -> None:
     if model_output is None:
         return
@@ -889,6 +967,23 @@ def count_redundant_same_label_splits(estimator: DecisionTreeClassifier) -> int:
     return redundant
 
 
+def priority_feature_importance(model: Pipeline) -> float:
+    feature_names = [
+        clean_feature_name(name)
+        for name in model.named_steps["preprocess"].get_feature_names_out()
+    ]
+    importances = model.named_steps["tree"].feature_importances_
+    return float(
+        np.sum(
+            [
+                importance
+                for name, importance in zip(feature_names, importances)
+                if name in PRIORITY_FEATURE_NAMES
+            ]
+        )
+    )
+
+
 def train_decision_tree(
     data: pd.DataFrame,
     *,
@@ -904,7 +999,10 @@ def train_decision_tree(
     grid_min_samples_split: list[int],
     grid_ccp_alphas: list[float],
     grid_class_weights: list[str | None],
+    hard_voting_sample_weight: float,
+    isolation_sample_weight: float,
 ) -> Pipeline:
+    data = add_engineered_feature_columns(data)
     missing = [column for column in FEATURE_COLUMNS if column not in data.columns]
     if missing:
         raise ValueError(f"Missing required feature columns: {missing}")
@@ -922,6 +1020,18 @@ def train_decision_tree(
 
     x = training_data[FEATURE_COLUMNS]
     y = training_data["best_explainer"].astype(str)
+    sample_weights = priority_sample_weights(
+        training_data,
+        hard_voting_sample_weight=hard_voting_sample_weight,
+        isolation_sample_weight=isolation_sample_weight,
+    )
+    if hard_voting_sample_weight != 1.0 or isolation_sample_weight != 1.0:
+        print(
+            "Priority sample weights: "
+            f"HARD voting x{hard_voting_sample_weight:g}, "
+            f"isolation x{isolation_sample_weight:g}; "
+            f"effective range {sample_weights.min():g}-{sample_weights.max():g}."
+        )
 
     class_counts = y.value_counts()
     can_split = (
@@ -930,9 +1040,10 @@ def train_decision_tree(
 
     if trainer == "grid":
         if can_split:
-            x_train, x_valid, y_train, y_valid = train_test_split(
+            x_train, x_valid, y_train, y_valid, w_train, w_valid = train_test_split(
                 x,
                 y,
+                sample_weights,
                 test_size=test_size,
                 random_state=random_state,
                 stratify=y,
@@ -940,6 +1051,7 @@ def train_decision_tree(
         else:
             x_train = x_valid = x
             y_train = y_valid = y
+            w_train = w_valid = sample_weights
             print(
                 "Not enough class diversity for a stratified validation split; "
                 "grid scores are training scores."
@@ -947,6 +1059,7 @@ def train_decision_tree(
 
         best_score = -1.0
         best_split_count: int | None = None
+        best_priority_importance = -1.0
         best_params: dict[str, Any] | None = None
         best_validation_report = ""
         tried = 0
@@ -968,27 +1081,39 @@ def train_decision_tree(
                     ),
                 ]
             )
-            candidate.fit(x_train, y_train)
+            candidate.fit(x_train, y_train, tree__sample_weight=w_train)
             predictions = candidate.predict(x_valid)
-            score = accuracy_score(y_valid, predictions)
+            score = accuracy_score(y_valid, predictions, sample_weight=w_valid)
             split_count = count_reachable_splits(candidate.named_steps["tree"])
+            candidate_priority_importance = priority_feature_importance(candidate)
             if (
                 score > best_score
                 or (
                     np.isclose(score, best_score)
                     and (
-                        best_split_count is None
-                        or split_count < best_split_count
+                        candidate_priority_importance > best_priority_importance
+                        or (
+                            np.isclose(
+                                candidate_priority_importance,
+                                best_priority_importance,
+                            )
+                            and (
+                                best_split_count is None
+                                or split_count < best_split_count
+                            )
+                        )
                     )
                 )
             ):
                 best_score = float(score)
                 best_split_count = split_count
+                best_priority_importance = candidate_priority_importance
                 best_params = params
                 best_validation_report = classification_report(
                     y_valid,
                     predictions,
                     labels=sorted(y.unique()),
+                    sample_weight=w_valid,
                     zero_division=0,
                 )
 
@@ -997,6 +1122,7 @@ def train_decision_tree(
 
         print(f"Grid search tried {tried} decision trees.")
         print(f"Best validation accuracy: {best_score:.4f}")
+        print(f"Best priority feature importance: {best_priority_importance:.4f}")
         print(f"Best hyperparameters: {best_params}")
         print("Best validation report:")
         print(best_validation_report)
@@ -1010,7 +1136,7 @@ def train_decision_tree(
                 ),
             ]
         )
-        pipeline.fit(x, y)
+        pipeline.fit(x, y, tree__sample_weight=sample_weights)
         tree = pipeline.named_steps["tree"]
         split_count_before = count_reachable_splits(tree)
         collapsed = prune_redundant_same_label_splits(tree)
@@ -1028,6 +1154,7 @@ def train_decision_tree(
                 y,
                 train_predictions,
                 labels=sorted(y.unique()),
+                sample_weight=sample_weights,
                 zero_division=0,
             )
         )
@@ -1082,14 +1209,15 @@ def train_decision_tree(
         len(training_data) >= 10 and len(class_counts) >= 2 and class_counts.min() >= 2
     )
     if can_split:
-        x_train, x_test, y_train, y_test = train_test_split(
+        x_train, x_test, y_train, y_test, w_train, w_test = train_test_split(
             x,
             y,
+            sample_weights,
             test_size=0.25,
             random_state=random_state,
             stratify=y,
         )
-        pipeline.fit(x_train, y_train)
+        pipeline.fit(x_train, y_train, tree__sample_weight=w_train)
         predictions = pipeline.predict(x_test)
         print("Validation report:")
         print(
@@ -1097,11 +1225,12 @@ def train_decision_tree(
                 y_test,
                 predictions,
                 labels=sorted(y.unique()),
+                sample_weight=w_test,
                 zero_division=0,
             )
         )
     else:
-        pipeline.fit(x, y)
+        pipeline.fit(x, y, tree__sample_weight=sample_weights)
         print(
             "Not enough class diversity for a stratified validation split; fitted on all rows."
         )
@@ -1145,6 +1274,7 @@ def recommend_best_explainer(
 
     if configurations.empty:
         raise ValueError("configurations must contain at least one row.")
+    configurations = add_engineered_feature_columns(configurations)
     missing = [column for column in FEATURE_COLUMNS if column not in configurations]
     if missing:
         raise ValueError(f"Missing required feature columns: {missing}")
@@ -1255,6 +1385,24 @@ def parse_args() -> argparse.Namespace:
         help="Comma-separated class_weight values for grid search: none,balanced.",
     )
     parser.add_argument(
+        "--hard-voting-sample-weight",
+        type=float,
+        default=2.0,
+        help=(
+            "Sample-weight multiplier for rows using HARD voting. Values above "
+            "1 make HARD-voting configurations more important during training."
+        ),
+    )
+    parser.add_argument(
+        "--isolation-sample-weight",
+        type=float,
+        default=2.0,
+        help=(
+            "Sample-weight multiplier for rows using isolation. Values above "
+            "1 make isolation configurations more important during training."
+        ),
+    )
+    parser.add_argument(
         "--ranking-policy",
         choices=("success_then_time", "time_then_success"),
         default="success_then_time",
@@ -1320,6 +1468,8 @@ def main() -> int:
         grid_min_samples_split=parse_int_grid(args.grid_min_samples_split),
         grid_ccp_alphas=parse_float_grid(args.grid_ccp_alphas),
         grid_class_weights=parse_class_weight_grid(args.grid_class_weights),
+        hard_voting_sample_weight=args.hard_voting_sample_weight,
+        isolation_sample_weight=args.isolation_sample_weight,
     )
     print(f"Saved decision-tree PDF to {args.tree_pdf}")
     if args.model_output is not None and joblib is not None:
