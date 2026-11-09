@@ -892,11 +892,9 @@ def cactus_cdf_plot(
 
 
 def distance_plot(
-    dataset: str,
     common_times: np.ndarray,
     stats: dict[str, tuple[np.ndarray, np.ndarray]],
     *,
-    model_type: str,
     output_dir: Path,
 ) -> None:
     if common_times.size == 0 or not stats:
@@ -935,7 +933,7 @@ def distance_plot(
         return
 
     ax.set_xlabel("Time (s)")
-    ax.set_ylabel("Normalized objective")
+    ax.set_ylabel("Normalized error")
     ax.set_xscale("log")
     ax.grid(True, linestyle="--", alpha=0.5)
     ax.legend()
@@ -1199,12 +1197,12 @@ def generate_plots_for_dataset(
         voting=normalized_voting,
         include_build_time=True,
     )
-    bundle_without_build = collect_method_data(
-        dataset,
-        model_type,
-        voting=normalized_voting,
-        include_build_time=False,
-    )
+    # bundle_without_build = collect_method_data(
+    #     dataset,
+    #     model_type,
+    #     voting=normalized_voting,
+    #     include_build_time=False,
+    # )
 
     if bundle_with_build.total_instances == 0:
         print(
@@ -1214,39 +1212,39 @@ def generate_plots_for_dataset(
 
     active_time_methods = bundle_with_build.active_time_methods
     if active_time_methods:
-        cactus_plot(
-            dataset,
-            bundle_without_build.times,
-            bundle_without_build.statuses,
-            bundle_without_build.has_cfs,
-            bundle_without_build.total_instances,
-            model_type=model_type,
-            output_dir=output_dir,
-            include_build_time=False,
-            filename="cactus.pdf",
-        )
-        cactus_plot(
-            dataset,
-            bundle_with_build.times,
-            bundle_with_build.statuses,
-            bundle_with_build.has_cfs,
-            bundle_with_build.total_instances,
-            model_type=model_type,
-            output_dir=output_dir,
-            include_build_time=True,
-            filename="cactus_with_build.pdf",
-        )
-        cactus_cdf_plot(
-            dataset,
-            bundle_without_build.times,
-            bundle_without_build.statuses,
-            bundle_without_build.has_cfs,
-            bundle_without_build.total_instances,
-            model_type=model_type,
-            output_dir=output_dir,
-            include_build_time=False,
-            filename="cactus_cdf.pdf",
-        )
+        # cactus_plot(
+        #     dataset,
+        #     bundle_without_build.times,
+        #     bundle_without_build.statuses,
+        #     bundle_without_build.has_cfs,
+        #     bundle_without_build.total_instances,
+        #     model_type=model_type,
+        #     output_dir=output_dir,
+        #     include_build_time=False,
+        #     filename="cactus.pdf",
+        # )
+        # cactus_plot(
+        #     dataset,
+        #     bundle_with_build.times,
+        #     bundle_with_build.statuses,
+        #     bundle_with_build.has_cfs,
+        #     bundle_with_build.total_instances,
+        #     model_type=model_type,
+        #     output_dir=output_dir,
+        #     include_build_time=True,
+        #     filename="cactus_with_build.pdf",
+        # )
+        # cactus_cdf_plot(
+        #     dataset,
+        #     bundle_without_build.times,
+        #     bundle_without_build.statuses,
+        #     bundle_without_build.has_cfs,
+        #     bundle_without_build.total_instances,
+        #     model_type=model_type,
+        #     output_dir=output_dir,
+        #     include_build_time=False,
+        #     filename="cactus_cdf.pdf",
+        # )
         cactus_cdf_plot(
             dataset,
             bundle_with_build.times,
@@ -1259,20 +1257,20 @@ def generate_plots_for_dataset(
             filename="cactus_cdf_with_build.pdf",
         )
 
-        tau_values, profile = compute_performance_profile(
-            {method: bundle_with_build.times[method] for method in active_time_methods},
-            {
-                method: bundle_with_build.has_cfs[method]
-                for method in active_time_methods
-            },
-        )
-        plot_profile(
-            dataset,
-            tau_values,
-            profile,
-            model_type=model_type,
-            output_dir=output_dir,
-        )
+        # tau_values, profile = compute_performance_profile(
+        #     {method: bundle_with_build.times[method] for method in active_time_methods},
+        #     {
+        #         method: bundle_with_build.has_cfs[method]
+        #         for method in active_time_methods
+        #     },
+        # )
+        # plot_profile(
+        #     dataset,
+        #     tau_values,
+        #     profile,
+        #     model_type=model_type,
+        #     output_dir=output_dir,
+        # )
 
         if "cp" in active_time_methods:
             for other_method in active_time_methods:
@@ -1289,17 +1287,17 @@ def generate_plots_for_dataset(
                     output_dir=output_dir,
                 )
 
-        plot_times_vs_parameter(
-            dataset,
-            "n_estimators",
-            N_ESTIMATORS,
-            model_type=model_type,
-            output_dir=output_dir,
-            max_depth=estimators_reference_depth,
-            voting=normalized_voting,
-            include_build_time=False,
-            filename="times_vs_estimators.pdf",
-        )
+        # plot_times_vs_parameter(
+        #     dataset,
+        #     "n_estimators",
+        #     N_ESTIMATORS,
+        #     model_type=model_type,
+        #     output_dir=output_dir,
+        #     max_depth=estimators_reference_depth,
+        #     voting=normalized_voting,
+        #     include_build_time=False,
+        #     filename="times_vs_estimators.pdf",
+        # )
         plot_times_vs_parameter(
             dataset,
             "n_estimators",
@@ -1311,17 +1309,17 @@ def generate_plots_for_dataset(
             include_build_time=True,
             filename="times_vs_estimators_with_build.pdf",
         )
-        plot_times_vs_parameter(
-            dataset,
-            "max_depth",
-            MAX_DEPTHS,
-            model_type=model_type,
-            output_dir=output_dir,
-            n_estimators=depth_reference_estimators,
-            voting=normalized_voting,
-            include_build_time=False,
-            filename="times_vs_depth.pdf",
-        )
+        # plot_times_vs_parameter(
+        #     dataset,
+        #     "max_depth",
+        #     MAX_DEPTHS,
+        #     model_type=model_type,
+        #     output_dir=output_dir,
+        #     n_estimators=depth_reference_estimators,
+        #     voting=normalized_voting,
+        #     include_build_time=False,
+        #     filename="times_vs_depth.pdf",
+        # )
         plot_times_vs_parameter(
             dataset,
             "max_depth",
@@ -1334,12 +1332,18 @@ def generate_plots_for_dataset(
             filename="times_vs_depth_with_build.pdf",
         )
 
-    common_times, stats = aggregate_callbacks(bundle_with_build.callbacks)
-    distance_plot(
+    bundle_with_build_default = collect_method_data(
         dataset,
+        model_type,
+        voting=normalized_voting,
+        include_build_time=True,
+        n_estimators=DEFAULT_N_ESTIMATORS,
+        max_depth=DEFAULT_MAX_DEPTH,
+    )
+    common_times, stats = aggregate_callbacks(bundle_with_build_default.callbacks)
+    distance_plot(
         common_times,
         stats,
-        model_type=model_type,
         output_dir=output_dir,
     )
 

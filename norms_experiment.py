@@ -238,6 +238,26 @@ def initialize_explanations(
     return explanations
 
 
+def maybe_adjust_cp_objective_scale(
+    *,
+    dataset: str,
+    method: str,
+    norm: int,
+    explainer: Any,
+) -> None:
+    if dataset != "OnlineNewsPopularity" or method != "cp" or norm != 2:
+        return
+
+    default_scale = getattr(explainer, "_obj_scale", None)
+    if default_scale == 10_000:
+        return
+    explainer._obj_scale = 10_000
+    print(
+        f"Adjusted CP objective scale for {dataset} norm={norm}: "
+        f"{default_scale} -> 10000"
+    )
+
+
 def explain_one(
     query: np.ndarray,
     target: int,
@@ -464,6 +484,12 @@ def run_dataset_experiment(
             result[f"{method}_build_time"] = build_time
 
         for norm in NORMS:
+            maybe_adjust_cp_objective_scale(
+                dataset=dataset,
+                method=method,
+                norm=norm,
+                explainer=explainer,
+            )
             metrics: list[dict[str, Any]] = []
             description = f"{dataset} | {method} | norm={norm}"
             for query, target in tqdm(query_target_pairs, desc=description):

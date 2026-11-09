@@ -20,3 +20,17 @@ VOTING = ["SOFT", "HARD"]
 TIMEOUT = 900  # seconds allowed for each explainer by explanation
 N_SAMPLES = 50  # number of queries to sample per dataset
 N_THREADS = 8  # number of threads per job
+
+
+DATASET_ACRONYMS = {
+    "Adult": "AD",
+    "BreastCancerWisconsin": "BC",
+    "COMPAS": "CP",
+    "CreditCard": "CC",
+    "GermanCredit": "GC",
+    "OnlineNewsPopularity": "ON",
+    "Phishing": "PH",
+    "Seeds": "SE",
+    "Spambase": "SP",
+    "StudentsPerformance": "ST",
+}

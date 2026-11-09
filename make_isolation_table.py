@@ -11,18 +11,20 @@ import numpy as np
 import pandas as pd
 
 try:
-    from parameters import DATASETS
+    from parameters import DATASETS, DATASET_ACRONYMS
 except Exception:  # pragma: no cover - keeps the script usable outside the repo root.
     DATASETS = []
+    DATASET_ACRONYMS = {}
 
 
 VARIANTS = {
     "CP-noIF": "cp_plain",
-    "CP-IF": "cp_iso",
     "MIP-noIF": "mip_plain",
+    "CP-IF": "cp_iso",
     "MIP-IF": "mip_iso",
 }
-METRICS = ("Plausibility (%)", "Mean time")
+METRICS = ("P (\%)", "T (s)")
+ADD_BUILD_TIME = True
 
 
 def load_entries(results_dir: Path) -> list[dict[str, Any]]:
@@ -71,11 +73,15 @@ def summarize_variant_from_explanations(
         if not isinstance(explanations, list):
             continue
 
+        build_time = (
+            finite_float(entry.get(f"{variant}_build_time")) if ADD_BUILD_TIME else 0.0
+        )
+
         for explanation in explanations:
             if not isinstance(explanation, dict):
                 continue
 
-            time_value = finite_float(explanation.get(f"{variant}_time"))
+            time_value = finite_float(explanation.get(f"{variant}_time")) + build_time
             if time_value is not None and time_value >= 0:
                 times.append(time_value)
 
@@ -85,64 +91,33 @@ def summarize_variant_from_explanations(
                     plausible += 1
 
     plausibility = None if found == 0 else 100.0 * plausible / found
-    mean_time = None if not times else float(np.mean(times))
-    return plausibility, mean_time
-
-
-def summarize_variant_from_entry_summaries(
-    entries: list[dict[str, Any]],
-    variant: str,
-) -> tuple[float | None, float | None]:
-    prevalence_values: list[tuple[float, float]] = []
-    time_values: list[tuple[float, float]] = []
-
-    for entry in entries:
-        prevalence = finite_float(entry.get(f"{variant}_plausibility_prevalence"))
-        cf_count = finite_float(entry.get(f"{variant}_cf_count"))
-        if prevalence is not None and cf_count is not None and cf_count > 0:
-            prevalence_values.append((100.0 * prevalence, cf_count))
-
-        mean_time = finite_float(entry.get(f"{variant}_mean_time"))
-        query_count = finite_float(entry.get("query_count"))
-        if mean_time is not None and query_count is not None and query_count > 0:
-            time_values.append((mean_time, query_count))
-
-    plausibility = (
-        None
-        if not prevalence_values
-        else float(
-            np.average(
-                [value for value, _ in prevalence_values],
-                weights=[weight for _, weight in prevalence_values],
-            )
-        )
-    )
-    mean_time = (
-        None
-        if not time_values
-        else float(
-            np.average(
-                [value for value, _ in time_values],
-                weights=[weight for _, weight in time_values],
-            )
-        )
-    )
-    return plausibility, mean_time
+    median_time = None if not times else float(np.median(times))
+    # mean_time = None if not times else float(np.mean(times))
+    return plausibility, median_time
 
 
 def summarize_variant(
     entries: list[dict[str, Any]],
     variant: str,
 ) -> tuple[float | None, float | None]:
-    plausibility, mean_time = summarize_variant_from_explanations(entries, variant)
-    if plausibility is not None or mean_time is not None:
-        return plausibility, mean_time
-    return summarize_variant_from_entry_summaries(entries, variant)
+    plausibility, median_time = summarize_variant_from_explanations(entries, variant)
+    assert plausibility is None or 0.0 <= plausibility <= 100.0, (
+        f"Invalid plausibility {plausibility} for variant {variant}"
+    )
+    assert median_time is None or median_time >= 0.0, (
+        f"Invalid median time {median_time} for variant {variant}"
+    )
+
+    return plausibility, median_time
 
 
 def ordered_datasets(found: set[str], include_missing: bool) -> list[str]:
     order: list[str] = []
-    known = list(DATASETS) if include_missing else [dataset for dataset in DATASETS if dataset in found]
+    known = (
+        list(DATASETS)
+        if include_missing
+        else [dataset for dataset in DATASETS if dataset in found]
+    )
     for dataset in known:
         if dataset not in order:
             order.append(dataset)
@@ -165,11 +140,11 @@ def build_table(entries: list[dict[str, Any]], include_missing: bool) -> pd.Data
         dataset_entries = by_dataset.get(dataset, [])
         row: dict[tuple[str, str], Any] = {}
         for label, variant in VARIANTS.items():
-            plausibility, mean_time = summarize_variant(dataset_entries, variant)
-            row[(label, "Plausibility (%)")] = plausibility
-            row[(label, "Mean time")] = mean_time
+            plausibility, median_time = summarize_variant(dataset_entries, variant)
+            row[(label, "P (\%)")] = plausibility
+            row[(label, "T (s)")] = median_time
         rows.append(row)
-        index.append(dataset)
+        index.append(DATASET_ACRONYMS[dataset])
 
     columns = pd.MultiIndex.from_product([VARIANTS.keys(), METRICS])
     return pd.DataFrame(rows, index=pd.Index(index, name="Dataset"), columns=columns)
@@ -248,9 +223,7 @@ def main() -> int:
             escape=False,
             na_rep="",
         )
-    args.latex_output.write_text(
-        latex
-    )
+    args.latex_output.write_text(latex)
 
     print(format_table(table, args.digits).to_string())
     print(f"\nSaved CSV table to {args.csv_output}")
