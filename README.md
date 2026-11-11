@@ -123,17 +123,29 @@ Following [Parmentier and Vidal (2021), Section 4.1](https://arxiv.org/pdf/2106.
 | ID | Dataset | Non-decreasing feature | Fixed feature |
 | --- | --- | --- | --- |
 | 1 | Adult | Age | Sex |
-| 3 | COMPAS | AgeGroup | Sex |
-| 4 | CreditCard | AgeGroup | isMale |
-| 5 | GermanCredit | Age | Sex (entire one-hot group) |
-| 10 | StudentsPerformance | age | sex |
+| 2 | COMPAS | AgeGroup | Sex |
+| 3 | CreditCard | AgeGroup | isMale |
+| 4 | GermanCredit | Age | Sex (entire one-hot group) |
+| 5 | StudentsPerformance | age | sex |
 
 Both actionability variants use `scale=True`: continuous features are scaled to `[-0.5, 0.5]` using the dataset minimum and maximum. Discrete features, including age and age groups, and categorical encodings remain unchanged. The main, norms, and isolation experiments use `scale=False`.
 
 Use `--experiment` and `--seed` to select a dataset and seed:
 
 ```bash
-python actionability_experiment.py --experiment 5 --seed 31 --threads 8
+python actionability_experiment.py --experiment=4 --seed 31 --threads 8
+```
+
+Each ID runs one dataset and writes its own result file, so IDs 1–5 can run as
+independent parallel jobs. For example, launch all five locally with one solver
+thread per job:
+
+```bash
+for i in 1 2 3 4 5; do
+  python actionability_experiment.py --experiment="$i" --threads 1 &
+done
+wait
+python make_actionability_table.py
 ```
 
 Results are saved to `results/rf/actionability/actionability_<id>.json`. They include settings and scaling, queries, counterfactuals, distances, timings, solver statuses, bounds and gaps, callbacks, constraint checks, and paired ratios with exclusion counts. Matching completed runs are skipped; use `--overwrite` to replace them.

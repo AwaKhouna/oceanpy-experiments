@@ -12,7 +12,7 @@ ACTIONABILITY = {
     "GermanCredit": {"Age": "increase", "Sex": "fixed"},
     "StudentsPerformance": {"age": "increase", "sex": "fixed"},
 }
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 VALIDATION_TOLERANCE = 1e-6
 
 

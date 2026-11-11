@@ -7,7 +7,7 @@ import pytest
 
 from actionability_metrics import paired_ratio
 from actionability_experiment import (
-    ACTIONABILITY, EXPERIMENT_IDS, SCHEMA_VERSION, add_summaries,
+    ACTIONABILITY, ACTIONABILITY_DATASETS, EXPERIMENT_IDS, SCHEMA_VERSION, add_summaries,
     save_entry, same_run, validate_actionability,
 )
 from make_actionability_table import build_table
@@ -66,7 +66,10 @@ def test_full_one_hot_group_and_age_validation():
     rules = ACTIONABILITY["GermanCredit"]
     assert validate_actionability(query, np.array([41., 1., 0.]), indices, rules) == []
     assert validate_actionability(query, np.array([39., 0., 1.]), indices, rules) == ["Age", "Sex"]
-    assert EXPERIMENT_IDS == (1, 3, 4, 5, 10)
+    assert EXPERIMENT_IDS == (1, 2, 3, 4, 5)
+    assert ACTIONABILITY_DATASETS == (
+        "Adult", "COMPAS", "CreditCard", "GermanCredit", "StudentsPerformance",
+    )
 
 
 def test_save_replaces_matching_run_and_preserves_other_budgets(tmp_path):

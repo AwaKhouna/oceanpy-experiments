@@ -29,7 +29,8 @@ from parameters import DATASETS, N_SAMPLES, N_THREADS, SEEDS, TIMEOUT, VOTING
 from run_experiment import load_dataset, get_node_count, get_split_levels
 from utils import train_model
 
-EXPERIMENT_IDS = tuple(i for i, name in enumerate(DATASETS, 1) if name in ACTIONABILITY)
+ACTIONABILITY_DATASETS = tuple(name for name in DATASETS if name in ACTIONABILITY)
+EXPERIMENT_IDS = tuple(range(1, len(ACTIONABILITY_DATASETS) + 1))
 VARIANTS = tuple((f"{method}_{suffix}", method, constrained)
                  for method in ("cp", "mip")
                  for suffix, constrained in (("plain", False), ("actionable", True)))
@@ -178,7 +179,7 @@ def run_dataset_experiment(experiment_id: int, *, seed: int, threads: int,
     if experiment_id not in EXPERIMENT_IDS:
         raise ValueError(f"Choose a dataset with actionability features: {EXPERIMENT_IDS}")
     require_actionability()
-    dataset = DATASETS[experiment_id - 1]
+    dataset = ACTIONABILITY_DATASETS[experiment_id - 1]
     rules = ACTIONABILITY[dataset]
     (X, y), mapper = load_dataset(dataset, scale=True)
     names = X.columns.get_level_values(0)
@@ -250,7 +251,8 @@ def run_dataset_experiment(experiment_id: int, *, seed: int, threads: int,
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--experiment", nargs="+", type=int, choices=EXPERIMENT_IDS,
-                        default=list(EXPERIMENT_IDS), help="Dataset IDs from parameters.py: 1, 3, 4, 5, 10")
+                        default=list(EXPERIMENT_IDS),
+                        help="Dataset IDs: 1=Adult, 2=COMPAS, 3=CreditCard, 4=GermanCredit, 5=StudentsPerformance. Default: all.")
     parser.add_argument("--seed", type=int, default=SEEDS[0])
     parser.add_argument("--threads", type=int, default=N_THREADS)
     parser.add_argument("--timeout", type=int, default=TIMEOUT)

@@ -34,7 +34,7 @@ from run_experiment import (  # noqa: E402
 )
 from utils import train_model  # noqa: E402
 
-METHODS = ("cp", "mip", "mace")
+METHODS = ("cp", "mip")
 NORMS = (0, 2)
 QUERY_RESULT_KEYS = METHOD_RESULT_KEYS + ("error",)
 EXPERIMENT_IDS = tuple(range(1, len(DATASETS) + 1))
