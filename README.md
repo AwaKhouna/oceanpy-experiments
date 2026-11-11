@@ -14,6 +14,8 @@ compares exact methods for counterfactual explanations on tree ensembles.
 - `norms_experiment.py`: experiments with L1, L2, and L-infinity norms.
 - `isolation_experiment.py`: experiments with and without Isolation Forest
   plausibility constraints.
+- `actionability_experiment.py`: paired CP/MIP experiments with and without
+  non-decreasing age and fixed sex.
 - `main_paper_plots.py`, `plot_results.py`, and `make_isolation_table.py`:
   scripts that rebuild figures and tables from saved JSON results.
 
@@ -122,6 +124,57 @@ python make_isolation_table.py
 ```
 
 This writes `results/rf/isolation/isolation_<id>.json` and rebuilds the table.
+
+Actionability experiments compare CP and MIP with and without feature constraints
+using the same queries and targets. The setup uses 100 trees, maximum depth 5,
+L1 distance, and the same sampling defaults as isolation.
+
+```bash
+python actionability_experiment.py --threads 8
+python make_actionability_table.py
+```
+
+Following [Parmentier and Vidal (2021), Section 4.1](https://arxiv.org/pdf/2106.06631),
+age cannot decrease and sex stays fixed. These rules are passed to each solver
+through `explain(..., actionability=...)`. Only datasets with these features are used:
+
+| ID | Dataset | Non-decreasing feature | Fixed feature |
+| --- | --- | --- | --- |
+| 1 | Adult | Age | Sex |
+| 3 | COMPAS | AgeGroup | Sex |
+| 4 | CreditCard | AgeGroup | isMale |
+| 5 | GermanCredit | Age | Sex (entire one-hot group) |
+| 10 | StudentsPerformance | age | sex |
+
+Both actionability variants use `scale=True`: continuous features are scaled to
+`[-0.5, 0.5]` using the dataset minimum and maximum. Discrete features, including
+age and age groups, and categorical encodings remain unchanged. The main, norms,
+and isolation experiments use `scale=False`.
+
+Use `--experiment` and `--seed` to select a dataset and seed:
+
+```bash
+python actionability_experiment.py --experiment 5 --seed 31 --threads 8
+```
+
+Results are saved to `results/rf/actionability/actionability_<id>.json`. They include
+settings and scaling, queries, counterfactuals, distances, timings, solver statuses,
+bounds and gaps, callbacks, constraint checks, and paired ratios with exclusion
+counts. Matching completed runs are skipped; use `--overwrite` to replace them.
+
+The table is saved to `plots/actionability_table.csv` and `.tex`, with CP/MIP
+columns for runs with and without actionability:
+
+- **D ratio:** mean of per-query `d_with / d_without` for valid pairs with a
+  positive baseline distance. Unconstrained columns equal 1. Missing or invalid
+  pairs are excluded. Use `--optimal-only` to include only proven-optimal pairs;
+  otherwise time-limited feasible solutions are included.
+- **T (s):** median of solve time plus explainer build time across all queries,
+  following the isolation table convention.
+
+The table defaults to soft voting; use `--voting HARD` for hard voting. Seeds are
+pooled. Keep runs with different solver budgets or configurations in separate
+`--results-dir` directories.
 
 ## Notes
 
