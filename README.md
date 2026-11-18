@@ -27,7 +27,7 @@ python3.12 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
-SETUPTOOLS_SCM_PRETEND_VERSION=2.0.7 python -m pip install -e OCEAN
+SETUPTOOLS_SCM_PRETEND_VERSION=2.0.8 python -m pip install -e OCEAN
 pysmt-install --z3 --confirm-agreement
 ```
 
@@ -128,7 +128,7 @@ Following [Parmentier and Vidal (2021), Section 4.1](https://arxiv.org/pdf/2106.
 | 4 | GermanCredit | Age | Sex (entire one-hot group) |
 | 5 | StudentsPerformance | age | sex |
 
-Both actionability variants use `scale=True`: continuous features are scaled to `[-0.5, 0.5]` using the dataset minimum and maximum. Discrete features, including age and age groups, and categorical encodings remain unchanged. The main, norms, and isolation experiments use `scale=False`.
+Both actionability variants use `scale=False`, with the same preprocessing as the main, norms, and isolation experiments. Earlier scaled results are excluded from the current actionability table.
 
 Use `--experiment` and `--seed` to select a dataset and seed:
 

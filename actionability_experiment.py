@@ -181,7 +181,7 @@ def run_dataset_experiment(experiment_id: int, *, seed: int, threads: int,
     require_actionability()
     dataset = ACTIONABILITY_DATASETS[experiment_id - 1]
     rules = ACTIONABILITY[dataset]
-    (X, y), mapper = load_dataset(dataset, scale=True)
+    (X, y), mapper = load_dataset(dataset, scale=False)
     names = X.columns.get_level_values(0)
     feature_indices = {name: np.flatnonzero(names == name).tolist() for name in mapper}
     for name in rules:
@@ -196,15 +196,15 @@ def run_dataset_experiment(experiment_id: int, *, seed: int, threads: int,
         schema_version=SCHEMA_VERSION, experiment_id=experiment_id, dataset=dataset,
         model_type="rf", n_estimators=RF_N_ESTIMATORS, max_depth=RF_MAX_DEPTH,
         norm=NORM, seed=seed, voting=voting, threads=threads, timeout=timeout,
-        scale=True,
-        scaling_definition="Continuous features: (x - min) / (max - min) - 0.5, fitted on the full dataset; discrete and encoded features unchanged",
+        scale=False,
+        scaling_definition="No feature scaling; same preprocessing as the main, norms, and isolation experiments",
         query_count=min(query_count, len(X)), actionability=rules,
         dataset_sha256=hashlib.sha256((ROOT / "datasets" / f"{dataset}.csv").read_bytes()).hexdigest(),
         ocean_revision=revision.stdout.strip() if revision.returncode == 0 else None,
         ocean_path=str(ocean_dir), variants=[v for v, _, _ in VARIANTS],
         feature_columns=[list(c) if isinstance(c, tuple) else c for c in X.columns],
         feature_indices=feature_indices, validation_tolerance=VALIDATION_TOLERANCE,
-        distance_definition="OCEAN get_distance(), norm=1, scale=True",
+        distance_definition="OCEAN get_distance(), norm=1, scale=False",
         ratio_definition="Arithmetic mean of per-query actionable/plain distances for valid paired CFs; baseline > 0",
         reference="https://arxiv.org/pdf/2106.06631 (Section 4.1)",
         complete=False,
