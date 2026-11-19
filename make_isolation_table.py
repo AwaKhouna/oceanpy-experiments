@@ -9,6 +9,7 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+from actionability_metrics import ACTIONABILITY, SCHEMA_VERSION as AC_SCHEMA_VERSION
 
 try:
     from parameters import DATASETS, DATASET_ACRONYMS
@@ -23,7 +24,7 @@ VARIANTS = {
     "CP-IF": "cp_iso",
     "MIP-IF": "mip_iso",
 }
-METRICS = ("P (\%)", "T (s)")
+METRICS = (r"P (\%)", "D ratio", "T (s)")
 ADD_BUILD_TIME = True
 
 
@@ -86,9 +87,9 @@ def summarize_variant_from_explanations(
             if not isinstance(explanation, dict):
                 continue
 
-            time_value = finite_float(explanation.get(f"{variant}_time")) + build_time
-            if time_value is not None and time_value >= 0:
-                times.append(time_value)
+            elapsed = finite_float(explanation.get(f"{variant}_time"))
+            if elapsed is not None and build_time is not None and min(elapsed, build_time) >= 0:
+                times.append(elapsed + build_time)
 
             if explanation.get(f"{variant}_cf") is not None:
                 found += 1
@@ -132,7 +133,43 @@ def ordered_datasets(found: set[str], include_missing: bool) -> list[str]:
     return order
 
 
-def build_table(entries: list[dict[str, Any]], include_missing: bool) -> pd.DataFrame:
+def mean_distance_ratio(entries: list[dict[str, Any]], variant: str) -> float | None:
+    method, suffix = variant.split("_", 1)
+    ratios = []
+    for entry in entries:
+        for row in entry.get("explanations", []):
+            if any(row.get(f"{method}_{s}_cf") is None or
+                   row.get(f"{method}_{s}_valid") is not True for s in ("plain", "iso")):
+                continue
+            if row.get(f"{method}_iso_plausible") is not True:
+                continue
+            plain = finite_float(row.get(f"{method}_plain_objective"))
+            constrained = finite_float(row.get(f"{method}_iso_objective"))
+            if plain is None or constrained is None or plain <= 0 or constrained < 0:
+                continue
+            ratio = constrained / plain
+            if np.isfinite(ratio):
+                ratios.append(1.0 if suffix == "plain" else ratio)
+    return float(np.mean(ratios)) if ratios else None
+
+
+def matching_ac_baselines(entries, actionability_entries):
+    match_keys = ("dataset", "seed", "voting", "n_estimators", "max_depth",
+                  "norm", "threads", "timeout", "query_count")
+    baselines = []
+    for entry in entries:
+        matches = [e for e in actionability_entries
+                   if e.get("complete") is True and e.get("schema_version") == AC_SCHEMA_VERSION
+                   and all(e.get(k) == entry.get(k) for k in match_keys)]
+        if len(matches) != 1:
+            raise ValueError(f"Expected one matching actionability result for {entry['dataset']}, "
+                             f"seed {entry.get('seed')}; found {len(matches)}")
+        baselines.extend(matches)
+    return baselines
+
+
+def build_table(entries: list[dict[str, Any]], include_missing: bool, *,
+                actionability_entries=None) -> pd.DataFrame:
     by_dataset: dict[str, list[dict[str, Any]]] = {}
     for entry in entries:
         dataset = entry.get("dataset")
@@ -143,11 +180,17 @@ def build_table(entries: list[dict[str, Any]], include_missing: bool) -> pd.Data
     index: list[str] = []
     for dataset in ordered_datasets(set(by_dataset), include_missing):
         dataset_entries = by_dataset.get(dataset, [])
+        ac_baselines = None
+        if actionability_entries is not None and dataset in ACTIONABILITY:
+            ac_baselines = matching_ac_baselines(dataset_entries, actionability_entries)
         row: dict[tuple[str, str], Any] = {}
         for label, variant in VARIANTS.items():
             plausibility, median_time = summarize_variant(dataset_entries, variant)
-            row[(label, "P (\%)")] = plausibility
+            if variant.endswith("_plain") and ac_baselines is not None:
+                _, median_time = summarize_variant_from_explanations(ac_baselines, variant)
+            row[(label, r"P (\%)")] = plausibility
             row[(label, "T (s)")] = median_time
+            row[(label, "D ratio")] = mean_distance_ratio(dataset_entries, variant)
         rows.append(row)
         index.append(DATASET_ACRONYMS[dataset])
 
@@ -172,8 +215,11 @@ def format_table(table: pd.DataFrame, digits: int) -> pd.DataFrame:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Create the CP/MIP noIF/IF plausibility and time table."
+        description="Create the CP/MIP noIF/IF plausibility, distance-ratio and time table."
     )
+    parser.add_argument("--actionability-results-dir", type=Path,
+                        default=Path("results/rf/actionability"),
+                        help="Matching noAC results used for noIF times on the five AC datasets")
     parser.add_argument(
         "--results-dir",
         type=Path,
@@ -209,7 +255,8 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     entries = load_entries(args.results_dir)
-    table = build_table(entries, include_missing=args.include_missing)
+    table = build_table(entries, include_missing=args.include_missing,
+                        actionability_entries=load_entries(args.actionability_results_dir))
 
     args.csv_output.parent.mkdir(parents=True, exist_ok=True)
     args.latex_output.parent.mkdir(parents=True, exist_ok=True)
@@ -231,6 +278,8 @@ def main() -> int:
     args.latex_output.write_text(latex)
 
     print(format_table(table, args.digits).to_string())
+    print("D ratio: mean paired withIF/noIF distance; noIF=1 on the same eligible pairs.")
+    print("noIF times use matching noAC results on AC datasets; other IF metrics use isolation results.")
     print(f"\nSaved CSV table to {args.csv_output}")
     print(f"Saved LaTeX table to {args.latex_output}")
     return 0

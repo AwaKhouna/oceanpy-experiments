@@ -153,7 +153,7 @@ Results are saved to `results/rf/actionability/actionability_<id>.json`. They in
 The table is saved to `plots/actionability_table.csv` and `.tex`, with CP/MIP columns for runs with and without actionability:
 
 - **D ratio:** mean of per-query `d_with / d_without` for valid pairs with a positive baseline distance. Unconstrained columns equal 1. Missing or invalid pairs are excluded. Use `--optimal-only` to include only proven-optimal pairs; otherwise time-limited feasible solutions are included.
-- **T (s):** median of solve time plus explainer build time across all queries, following the isolation table convention.
+- **T (s):** median of solve time plus explainer build time across all queries. All columns use the actionability results.
 
 The table defaults to soft voting; use `--voting HARD` for hard voting. Seeds are pooled. Keep runs with different solver budgets or configurations in separate `--results-dir` directories.
 
