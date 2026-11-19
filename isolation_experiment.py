@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+from copy import deepcopy
 import gc
 import json
 import os
@@ -97,6 +98,8 @@ def entry_identity(entry: dict[str, Any]) -> tuple[Any, ...]:
 
 
 def is_complete_entry(entry: dict[str, Any]) -> bool:
+    if entry.get("mapper_isolated") is not True:
+        return False
     explanations = entry.get("explanations")
     if not isinstance(explanations, list):
         return False
@@ -354,6 +357,8 @@ def make_explainer(
     isolation_threshold: float | None,
 ) -> tuple[Any, float]:
     t0 = time.time()
+    # OCEAN adds tree thresholds in place; isolate each explainer's feature state.
+    mapper = deepcopy(mapper)
     if method == "cp":
         kwargs: dict[str, Any] = {}
         if isolation is not None:
@@ -621,6 +626,7 @@ def run_dataset_experiment(
 
     result: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
+        "mapper_isolated": True,
         "experiment_id": experiment_id,
         "dataset": dataset,
         "model_type": "rf",
@@ -652,8 +658,12 @@ def run_dataset_experiment(
         )
         variant_build_time = 0.0
         target_build_times: dict[str, float] = {}
-        for target_class, indexed_queries in grouped_queries.items():
-            context = target_isolators[target_class]
+        build_groups = list(grouped_queries.items())
+        if not use_isolation:
+            # One plain model serves all targets; explain() resets query constraints.
+            build_groups = [("shared", [item for group in grouped_queries.values() for item in group])]
+        for target_class, indexed_queries in build_groups:
+            context = target_isolators[target_class] if use_isolation else None
             explainer, build_time = make_explainer(
                 method,
                 model=model,
@@ -669,6 +679,7 @@ def run_dataset_experiment(
             )
             try:
                 for idx, query, target in tqdm(indexed_queries, desc=description):
+                    context = target_isolators[target]
                     metric = explain_one(
                         query,
                         target,
