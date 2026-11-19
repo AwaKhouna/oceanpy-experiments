@@ -76,6 +76,11 @@ def summarize_variant_from_explanations(
         build_time = (
             finite_float(entry.get(f"{variant}_build_time")) if ADD_BUILD_TIME else 0.0
         )
+        if ADD_BUILD_TIME and variant.endswith("_plain"):
+            target_build_times = entry.get(f"{variant}_target_build_times", {})
+            if target_build_times:
+                # Count only the first recorded baseline build.
+                build_time = float(next(iter(target_build_times.values())))
 
         for explanation in explanations:
             if not isinstance(explanation, dict):
